@@ -7,7 +7,7 @@ const LS_SETTINGS = 'st-bw-settings';
 const LS_WISHES = 'st-bw-wishes';       // { '月-日|avatar': '祝福文本' }
 const LS_STATS = 'st-bw-stats';         // { date: 'M-D', list: [{avatar,name,count}] }
 const OVERLAY_ID = 'st-bw-overlay';
-const BTN_ID = 'st-bw-btn';
+const WAND_ID = 'st-bw-wand';
 
 let settings = { birthday: '', baseUrl: '', apiKey: '', model: '', threshold: 10 };
 
@@ -267,17 +267,9 @@ function buildSettingsHTML() {
 function openPanel() {
     const $old = $('#st-bw-panel');
     if ($old.length) { $old.remove(); return; }
-    const $b = $('#' + BTN_ID);
     const $panel = $('<div id="st-bw-panel" class="st-bw-panel"></div>');
     $panel.html(buildSettingsHTML());
     $('body').append($panel);
-    const r = $b[0].getBoundingClientRect();
-    const pw = $panel[0].offsetWidth;
-    const ph = $panel[0].offsetHeight;
-    $panel.css({
-        bottom: Math.max(8, window.innerHeight - r.top + 8) + 'px',
-        right: Math.max(8, window.innerWidth - r.right + 8) + 'px',
-    });
     $panel.on('mousedown.stbw touchstart.stbw', function (e) { e.stopPropagation(); });
     $panel.on('click.stbwAct', '#st-bw-save', function () {
         settings.birthday = String($panel.find('#st-bw-birthday').val() || '').trim();
@@ -303,16 +295,27 @@ function openPanel() {
     });
 }
 
+// ---------- 魔法棒菜单入口注入 ----------
 function injectButton() {
-    if ($('#' + BTN_ID).length) return;
-    const $btn = $('<div id="' + BTN_ID + '" class="st-bw-btn" title="🎂 生日祝福设置 / 预览">🎂</div>');
-    $('body').append($btn);
-    $btn.on('click', function (e) { e.stopPropagation(); openPanel(); });
+    const menu = document.getElementById('extensionsMenu');
+    if (!menu || document.getElementById(WAND_ID)) return;
+    const el = document.createElement('div');
+    el.id = WAND_ID;
+    el.className = 'list-group-item flex-container flexGap5 interactable';
+    el.setAttribute('tabindex', '0');
+    el.title = '🎂 生日祝福设置 / 预览';
+    el.textContent = '🎂 生日祝福';
+    el.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        openPanel();
+    });
+    menu.appendChild(el);
 }
 
 $(function () {
     injectButton();
-    setInterval(function () { if (!$('#' + BTN_ID).length) injectButton(); }, 3000);
+    setInterval(function () { if (!document.getElementById(WAND_ID)) injectButton(); }, 3000);
     // 进入酒馆自动检测生日
     setTimeout(function () {
         if (settings.birthday) triggerBirthday(false);
@@ -320,7 +323,7 @@ $(function () {
 });
 
 $(document).on('mousedown.stbw touchstart.stbw', function (e) {
-    if (!$(e.target).closest('#' + BTN_ID).length && !$(e.target).closest('#st-bw-panel').length && !$(e.target).closest('#' + OVERLAY_ID).length) {
+    if (!$(e.target).closest('#' + WAND_ID).length && !$(e.target).closest('#st-bw-panel').length && !$(e.target).closest('#' + OVERLAY_ID).length) {
         $('#st-bw-panel').remove();
     }
 });
@@ -331,9 +334,7 @@ if (!document.getElementById(STYLE_ID)) {
     const style = document.createElement('style');
     style.id = STYLE_ID;
     style.textContent = `
-#st-bw-btn { position:fixed; right:14px; bottom:132px; z-index:99990; width:42px; height:42px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:20px; cursor:pointer; background:rgba(242,217,184,.95); border:1px solid rgba(255,255,255,.4); box-shadow:0 3px 12px rgba(0,0,0,.3); }
-#st-bw-btn:hover { transform:scale(1.08); }
-.st-bw-panel { position:fixed; z-index:99999; width:min(320px,calc(100vw - 24px)); max-height:80vh; overflow-y:auto; background:var(--SmartThemeBlurTintColor,#1e1e2e); color:var(--SmartThemeMainColor,#e0e0e0); border:1px solid var(--SmartThemeBorderColor,#666); border-radius:12px; padding:10px 12px; box-shadow:0 6px 24px rgba(0,0,0,.4); font-size:13px; }
+.st-bw-panel { position:fixed; top:12px; right:12px; z-index:99999; width:min(320px,calc(100vw - 24px)); max-height:80vh; overflow-y:auto; background:var(--SmartThemeBlurTintColor,#1e1e2e); color:var(--SmartThemeMainColor,#e0e0e0); border:1px solid var(--SmartThemeBorderColor,#666); border-radius:12px; padding:10px 12px; box-shadow:0 6px 24px rgba(0,0,0,.4); font-size:13px; }
 .st-bw-title { font-weight:700; margin-bottom:8px; color:#E8C9A0; }
 .st-bw-row { margin-bottom:8px; }
 .st-bw-row label { display:block; font-size:12px; opacity:.8; margin-bottom:2px; }

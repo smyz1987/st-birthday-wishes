@@ -104,12 +104,14 @@ async function fetchModels(baseUrl, apiKey) {
 async function genWish(char, force) {
     const key = todayMD() + '|' + char.avatar;
     const cache = (() => { try { return JSON.parse(localStorage.getItem(LS_WISHES) || '{}'); } catch { return {}; } })();
-    if (!force && cache[key]) return cache[key];
+    const prev = cache[key];
+    // 旧版本缓存是纯字符串（无完整设计），视为无效，重新生成
+    if (!force && prev && typeof prev === 'object' && prev.wish && prev.bg1) return prev;
     const c = getContext().characters.find(x => String(x.avatar || (x.data && x.data.avatar)) === char.avatar);
     const desc = truncate(String((c && (c.description || (c.data && c.data.description))) || ''), 500);
     const first = truncate(String((c && (c.first_mes || (c.data && c.data.first_mes))) || ''), 300);
-    const sys = '你正在扮演角色「' + char.name + '」。' + (desc ? '人设：' + desc : '') + (first ? '开场白：' + first : '') + '今天是用户的生日。请完全以「' + char.name + '」的身份，像 TA 真的对在乎的人说话那样：\n【祝福】写一段 60-140 字的生日祝福，内容必须人设专属：结合 TA 的性格、说话习惯、称呼方式、职业/身份、可能送的礼物或做的事。绝对禁止只写"生日快乐"四个字，禁止套话。\n【角色语】另写一句 10-20 字、只有 TA 会说的话（TA 的口头禅、人生信条、或 TA 最想对你说的一句话，要贴合人设与生日主题）。\n不要提到 AI/模型/扮演，不要解释。严格按下面格式输出：\n【祝福】\n<祝福内容>\n【角色语】\n<那句话>';
-    const usr = '今天是我生日。你会对我说什么？';
+    const sys = '为角色「' + char.name + '」设计一张生日卡片（今天是我的生日）。角色资料：' + (desc ? '人设：' + desc : '') + (first ? '开场白：' + first : '') + '。\n请以角色本人视角完成以下全部内容，每一部分都必须贴合这个角色的性格、身份、世界观，绝对禁止模板化、套话：\n1) wish：60-140字的生日祝福，人设专属，绝对禁止只写"生日快乐"四个字；\n2) motto：一句只有TA会说的生日句子（口头禅/人生信条/最想对我说的话，10-20字）；\n3) title：卡片标题短语（4-10字，人设专属，如「深渊的贺礼」「来自星海的信号」）；\n4) bg1、bg2：两个十六进制颜色，组成卡片渐变背景，要贴合角色世界观色调；\n5) accent：一个十六进制强调色（装饰与署名用，要比背景亮）；\n6) deco：3-5个贴合角色气质的装饰emoji。\n不要任何解释，只输出一个 JSON 对象，严格如下格式：\n{"wish":"...","motto":"...","title":"...","bg1":"#xxxxxx","bg2":"#xxxxxx","accent":"#xxxxxx","deco":["...","..."]}';
+    const usr = '今天是我生日。';
     let raw;
     if (settings.useMain) {
         raw = await mainQuiet(sys + '\n\n' + usr);
@@ -131,7 +133,7 @@ async function genWish(char, force) {
                     { role: 'user', content: usr },
                 ],
                 temperature: 0.95,
-                max_tokens: 500,
+                max_tokens: 600,
             }),
         });
         if (!res.ok) {
@@ -144,85 +146,82 @@ async function genWish(char, force) {
         if (!text) throw new Error('API 返回为空');
         raw = String(text).trim();
     }
-    // 解析【祝福】/【角色语】
-    let wish = raw, motto = '';
-    const mW = raw.match(/【祝福】\s*([\s\S]*?)(?=【角色语】|$)/);
-    const mM = raw.match(/【角色语】\s*([\s\S]+)/);
-    if (mW && mW[1]) wish = mW[1].trim();
-    if (mM && mM[1]) motto = mM[1].trim().replace(/^[「"']+|[」"']+$/g, '');
-    const out = { wish, motto };
+    // 解析 AI 输出的卡片设计 JSON
+    const d = parseCardJSON(raw);
+    const fb = fallbackDesign(char);
+    const isHex = v => /^#[0-9a-fA-F]{6}$/.test(String(v || '').trim());
+    const out = {
+        wish: d && d.wish ? String(d.wish).trim() : (raw || '……'),
+        motto: d && d.motto ? String(d.motto).trim() : fb.motto,
+        title: d && d.title ? String(d.title).trim() : fb.title,
+        bg1: d && isHex(d.bg1) ? String(d.bg1) : fb.bg1,
+        bg2: d && isHex(d.bg2) ? String(d.bg2) : fb.bg2,
+        accent: d && isHex(d.accent) ? String(d.accent) : fb.accent,
+        deco: d && Array.isArray(d.deco) && d.deco.length ? d.deco.slice(0, 5).map(String) : fb.deco,
+    };
     cache[key] = out;
     localStorage.setItem(LS_WISHES, JSON.stringify(cache));
     return out;
 }
 
-// 根据角色人设/标签推断卡片主题（配色 + 装饰物），并加入角色名微调让每张卡独一无二
-function cardTheme(char) {
-    const hay = String(char.name + ' ' + (char.tags ? char.tags.join(' ') : '') + ' ' + (char.description || '')).toLowerCase();
-    const themes = [
-        { id: 'sweet', label: '甜宠', g1: '#F9E4E4', g2: '#F2D9B8', accent: '#D9A7A7', accentDark: '#B06060', emoji: '🎀', deco: ['🎀', '🍰', '💐'], mottoD: '想把你捧在手心', keywords: ['甜', '宠', '恋爱', '软萌', '治愈', '温柔', '阳光', '爱', '恋', '公主', '哥哥', '黏人'] },
-        { id: 'dark', label: '暗夜', g1: '#2a1515', g2: '#4a1f1f', accent: '#B03030', accentDark: '#E06060', emoji: '🩸', deco: ['🩸', '🕯️', '🥀'], mottoD: '你属于我，仅此一天', keywords: ['黑暗', '血腥', '虐', '病娇', '扭曲', '疯狂', '绝望', '阴郁', '残酷', '深渊', '恶魔', '血', '疯批', '疯'] },
-        { id: 'mystery', label: '悬疑', g1: '#151d2e', g2: '#26354d', accent: '#7aa2d0', accentDark: '#c0d8f0', emoji: '🔍', deco: ['🔍', '🕰️', '🗝️'], mottoD: '秘密，我只告诉你一个', keywords: ['悬疑', '侦探', '谜', '案件', '秘密', '推理', '阴谋', '调查', '真相', '诡', '失踪'] },
-        { id: 'scifi', label: '科幻', g1: '#0f1a26', g2: '#1c3540', accent: '#4fc3e8', accentDark: '#a8e6ff', emoji: '🚀', deco: ['🚀', '🛰️', '⚙️'], mottoD: '信号会穿越星海找到你', keywords: ['科幻', '未来', '机器人', '宇宙', '赛博', '机械', '科技', '仿生', '太空', '代码', 'ai', '仿生人'] },
-        { id: 'fantasy', label: '奇幻', g1: '#221730', g2: '#3a2750', accent: '#9a7ad0', accentDark: '#d8c4f0', emoji: '🔮', deco: ['🔮', '⚔️', '🐉'], mottoD: '为你许下一个魔法契约', keywords: ['魔法', '奇幻', '异世界', '勇者', '精灵', '龙', '巫师', '炼金', '剑', '魔女', '骑士'] },
-        { id: 'nature', label: '草木', g1: '#14231a', g2: '#27452b', accent: '#7fc07a', accentDark: '#c8e8c0', emoji: '🌿', deco: ['🌿', '🍃', '🌼'], mottoD: '想带你去闻一闻风', keywords: ['治愈', '植物', '森林', '猫咪', '自然', '花', '山', '海', '风', '光', '安静', '毛茸茸'] },
-        { id: 'warm', label: '日常', g1: '#2e2415', g2: '#4a3a20', accent: '#d0b078', accentDark: '#f0e0b0', emoji: '☕', deco: ['☕', '📖', '🪴'], mottoD: '今天也一起回家吧', keywords: ['日常', '生活', '室友', '校园', '朋友', '温馨', '陪伴', '邻居', '同学'] },
-    ];
-    let best = themes[0], bestScore = 0;
-    for (const t of themes) {
-        let s = 0;
-        for (const k of t.keywords) if (hay.includes(k)) s++;
-        if (s > bestScore) { bestScore = s; best = t; }
-    }
-    // 角色名哈希 → 微调两个渐变色的色相，让每张卡都有细微差别
-    let h = 0;
-    for (let i = 0; i < char.name.length; i++) h = (h * 31 + char.name.charCodeAt(i)) >>> 0;
-    const shift = (h % 18) - 9;
-    best.hue = shift;
-    return best;
+// 从 AI 输出中容错提取 JSON 对象
+function parseCardJSON(raw) {
+    const s = String(raw || '').trim();
+    const start = s.indexOf('{');
+    const end = s.lastIndexOf('}');
+    if (start < 0 || end <= start) return null;
+    try { return JSON.parse(s.slice(start, end + 1)); } catch { return null; }
 }
 
-function hueShift(hex, deg) {
-    try {
-        const m = hex.match(/^#([0-9a-f]{6})$/i);
-        if (!m || !deg) return hex;
-        let r = parseInt(m[1].slice(0, 2), 16) / 255, g = parseInt(m[1].slice(2, 4), 16) / 255, b = parseInt(m[1].slice(4, 6), 16) / 255;
-        const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
-        let h = 0, s = 0, l = (mx + mn) / 2;
-        const d = mx - mn;
-        if (d) {
-            s = l > .5 ? d / (2 - mx - mn) : d / (mx + mn);
-            if (mx === r) h = ((g - b) / d + (g < b ? 6 : 0)) % 6;
-            else if (mx === g) h = (b - r) / d + 2;
-            else h = (r - g) / d + 4;
-            h *= 60;
-        }
-        h = ((h + deg) % 360 + 360) % 360;
-        const c = (1 - Math.abs(2 * l - 1)) * s, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m2 = l - c / 2;
-        let rr = 0, gg = 0, bb = 0;
-        if (h < 60) { rr = c; gg = x; }
-        else if (h < 120) { rr = x; gg = c; }
-        else if (h < 180) { gg = c; bb = x; }
-        else if (h < 240) { gg = x; bb = c; }
-        else if (h < 300) { rr = x; bb = c; }
-        else { rr = c; bb = x; }
-        const to = v => Math.round((v + m2) * 255).toString(16).padStart(2, '0');
-        return '#' + to(rr) + to(gg) + to(bb);
-    } catch { return hex; }
+// 解析失败时的兜底设计：按角色名哈希生成稳定配色，保证每个角色仍各不相同
+function fallbackDesign(char) {
+    let h = 0;
+    for (let i = 0; i < char.name.length; i++) h = (h * 31 + char.name.charCodeAt(i)) >>> 0;
+    const base = [0, 350, 210, 270, 330, 190, 90, 30];
+    const hue = base[h % base.length];
+    return {
+        motto: '……',
+        title: char.name + ' 的赠礼',
+        bg1: hslToHex(hue, 55, 17),
+        bg2: hslToHex((hue + 30) % 360, 45, 28),
+        accent: hslToHex((hue + 200) % 360, 65, 62),
+        deco: ['🎁', '🕯️', '🌹'],
+    };
+}
+
+function hslToHex(h, s, l) {
+    s = s / 100; l = l / 100;
+    const k = n => (n + h / 30) % 12;
+    const a = s * Math.min(l, 1 - l);
+    const f = n => {
+        const c = l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+        return Math.round(c * 255).toString(16).padStart(2, '0');
+    };
+    return '#' + f(0) + f(8) + f(4);
+}
+
+// 按背景亮度决定正文用深色还是浅色字
+function isLight(hex) {
+    const s = String(hex || '').replace('#', '');
+    if (s.length !== 6) return false;
+    const r = parseInt(s.slice(0, 2), 16), g = parseInt(s.slice(2, 4), 16), b = parseInt(s.slice(4, 6), 16);
+    return (0.299 * r + 0.587 * g + 0.114 * b) > 150;
 }
 
 // ---------- 卡片渲染 & 保存 ----------
 function cardHTML(char, obj) {
-    const t = cardTheme(char);
-    const wish = typeof obj === 'string' ? obj : (obj && obj.wish) || '';
-    const motto = typeof obj === 'string' ? '' : (obj && obj.motto) || '';
-    const g1 = hueShift(t.g1, t.hue), g2 = hueShift(t.g2, t.hue);
-    return '<div class="st-bw-card" data-avatar="' + escapeHtml(char.avatar) + '" style="background:linear-gradient(135deg,' + g1 + ',' + g2 + ');border:1px solid ' + t.accent + ';">' +
-        '<div class="st-bw-card-deco">' + t.deco.map(function (d) { return '<span>' + d + '</span>'; }).join('') + '</div>' +
-        '<div class="st-bw-card-tag" style="color:' + t.accentDark + ';">' + escapeHtml(t.label) + '系 · ' + escapeHtml(char.name) + '</div>' +
-        '<div class="st-bw-card-motto">' + (motto ? '「' + escapeHtml(motto) + '」' : escapeHtml(t.mottoD)) + '</div>' +
-        '<div class="st-bw-card-wish" style="color:' + (t.id === 'dark' ? '#f0d0d0' : '#5a3a3a') + ';">' + escapeHtml(wish) + '</div>' +
-        '<div class="st-bw-card-from" style="color:' + t.accentDark + ';">—— ' + escapeHtml(char.name) + '</div>' +
+    const o = typeof obj === 'string'
+        ? { wish: obj, motto: '', title: char.name + ' 的赠礼', bg1: '#2a1515', bg2: '#4a1f1f', accent: '#E06060', deco: ['🎁', '🕯️', '🌹'] }
+        : (obj || {});
+    const deco = Array.isArray(o.deco) && o.deco.length ? o.deco : ['🎁'];
+    const body = isLight(o.bg1) ? '#4a3a3a' : '#f2e2e6';
+    return '<div class="st-bw-card" data-avatar="' + escapeHtml(char.avatar) + '" style="background:linear-gradient(135deg,' + o.bg1 + ',' + o.bg2 + ');border:1px solid ' + o.accent + ';">' +
+        '<div class="st-bw-card-deco">' + deco.map(function (d) { return '<span>' + escapeHtml(d) + '</span>'; }).join('') + '</div>' +
+        '<div class="st-bw-card-title" style="color:' + o.accent + ';">' + escapeHtml(o.title || (char.name + ' 的赠礼')) + '</div>' +
+        '<div class="st-bw-card-tag" style="color:' + o.accent + ';">' + escapeHtml(char.name) + '</div>' +
+        '<div class="st-bw-card-motto">' + (o.motto ? '「' + escapeHtml(o.motto) + '」' : '') + '</div>' +
+        '<div class="st-bw-card-wish" style="color:' + body + ';">' + escapeHtml(o.wish || '') + '</div>' +
+        '<div class="st-bw-card-from" style="color:' + o.accent + ';">—— ' + escapeHtml(char.name) + '</div>' +
         '<div class="st-bw-card-actions">' +
         '<span class="st-bw-act" data-act="regen">🔄 重新生成</span>' +
         '<span class="st-bw-act" data-act="save">💾 保存图片</span>' +
@@ -232,57 +231,62 @@ function cardHTML(char, obj) {
 
 function buildCanvasCard(char, obj, size) {
     const W = 600, H = 360;
-    const t = cardTheme(char);
-    const wish = typeof obj === 'string' ? obj : (obj && obj.wish) || '';
-    const motto = typeof obj === 'string' ? '' : (obj && obj.motto) || '';
-    const g1 = hueShift(t.g1, t.hue), g2 = hueShift(t.g2, t.hue);
+    const o = typeof obj === 'string'
+        ? { wish: obj, motto: '', title: char.name + ' 的赠礼', bg1: '#2a1515', bg2: '#4a1f1f', accent: '#E06060', deco: ['🎁', '🕯️', '🌹'] }
+        : (obj || {});
+    const deco = Array.isArray(o.deco) && o.deco.length ? o.deco : ['🎁'];
+    const g1 = o.bg1, g2 = o.bg2;
+    const body = isLight(g1) ? '#4a3a3a' : '#f2e2e6';
     const canvas = document.createElement('canvas');
     canvas.width = W; canvas.height = H;
     const g = canvas.getContext('2d');
-    // 背景渐变（按角色主题色 + 微调）
+    // 背景渐变（AI 给出的角色专属配色）
     const grad = g.createLinearGradient(0, 0, W, H);
     grad.addColorStop(0, g1);
     grad.addColorStop(0.55, g2);
     grad.addColorStop(1, g1);
     g.fillStyle = grad;
     g.fillRect(0, 0, W, H);
-    // 装饰圆（主题强调色）
-    g.fillStyle = t.accent;
+    // 装饰圆（强调色）
+    g.fillStyle = o.accent;
     g.globalAlpha = .55;
     g.beginPath(); g.arc(80, 90, 34, 0, Math.PI * 2); g.fill();
     g.beginPath(); g.arc(W - 80, 80, 26, 0, Math.PI * 2); g.fill();
-    g.fillStyle = t.accentDark;
-    g.beginPath(); g.arc(W - 90, 150, 18, 0, Math.PI * 2); g.fill();
     g.globalAlpha = .35;
     g.fillRect(40, H - 60, W - 80, 8);
     g.globalAlpha = 1;
-    // 主题装饰物（左上 + 右上 + 左下）
+    // 主题装饰物（左上 + 右上）
     g.font = '24px "Segoe UI Emoji", "Apple Color Emoji", sans-serif';
     g.textAlign = 'left';
-    g.fillText(t.deco[0], 26, 320);
-    g.fillText(t.deco[1], W - 96, 58);
+    g.fillText(deco[0], 26, 320);
+    if (deco[1]) g.fillText(deco[1], W - 96, 58);
     g.textAlign = 'center';
-    // 主题标签 + 角色名
-    g.fillStyle = t.accentDark;
+    // 标题（AI 专属短语）
+    g.fillStyle = o.accent;
+    g.font = 'bold 24px "Segoe UI", "Microsoft YaHei", sans-serif';
+    g.fillText(String(o.title || char.name + ' 的赠礼'), W / 2, 46);
+    // 角色名
+    g.fillStyle = o.accent;
     g.font = 'bold 14px "Segoe UI", "Microsoft YaHei", sans-serif';
-    g.fillText(t.label + '系 · ' + char.name, W / 2, 44);
+    g.fillText(char.name, W / 2, 70);
     // 角色专属句子（motto）
-    g.fillStyle = t.accent;
-    g.font = 'bold 20px "Segoe UI", "Microsoft YaHei", sans-serif';
-    g.fillText('「' + (motto || t.mottoD) + '」', W / 2, 74);
+    if (o.motto) {
+        g.font = 'bold 19px "Segoe UI", "Microsoft YaHei", sans-serif';
+        g.fillText('「' + o.motto + '」', W / 2, 98);
+    }
     // 祝福正文（自动换行）
-    g.fillStyle = t.id === 'dark' ? '#f0d0d0' : '#5a3a3a';
+    g.fillStyle = body;
     g.font = '16px "Segoe UI", "Microsoft YaHei", sans-serif';
     const maxW = W - 80;
-    const lines = wrapText(g, wish, maxW);
-    let y = 110;
+    const lines = wrapText(g, o.wish || '', maxW);
+    let y = 132;
     for (const ln of lines.slice(0, 8)) { g.fillText(ln, W / 2, y); y += 26; }
     // 署名
-    g.fillStyle = t.accentDark;
+    g.fillStyle = o.accent;
     g.font = 'bold 15px "Segoe UI", "Microsoft YaHei", sans-serif';
     g.fillText('—— ' + char.name, W / 2, y + 14);
     // 底部装饰点
-    g.fillStyle = t.accent;
+    g.fillStyle = o.accent;
     g.globalAlpha = .6;
     for (let i = 0; i < 8; i++) {
         g.beginPath(); g.arc(90 + i * 62, H - 26, 4, 0, Math.PI * 2); g.fill();
@@ -550,7 +554,8 @@ if (!document.getElementById(STYLE_ID)) {
 .st-bw-loading { text-align:center; padding:40px 0; color:#E88383; }
 .st-bw-card { border-radius:16px; padding:22px 22px 14px; box-shadow:0 8px 30px rgba(0,0,0,.35); }
 .st-bw-card-deco { display:flex; justify-content:center; gap:14px; font-size:22px; margin-bottom:8px; }
-.st-bw-card-tag { text-align:center; font-size:12px; font-weight:700; margin-bottom:6px; opacity:.9; }
+.st-bw-card-title { text-align:center; font-size:22px; font-weight:700; margin-bottom:4px; }
+.st-bw-card-tag { text-align:center; font-size:12px; font-weight:700; margin-bottom:8px; opacity:.9; }
 .st-bw-card-motto { text-align:center; font-size:17px; font-weight:700; margin-bottom:12px; min-height:24px; }
 .st-bw-card-from { text-align:center; font-size:15px; font-weight:700; margin:12px 0 2px; }
 .st-bw-card-wish { font-size:15px; line-height:1.7; text-align:center; word-break:break-all; }

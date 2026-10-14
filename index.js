@@ -293,11 +293,11 @@ async function triggerBirthday(force) {
 // ---------- 魔法棒入口 & 设置 ----------
 function buildSettingsHTML() {
     return '<div class="st-bw-title">🎂 生日祝福 · 设置</div>' +
-        '<div class="st-bw-row st-bw-toggle"><label>启用生日祝福</label>' +
+        '<div class="st-bw-row st-bw-toggle"><label for="st-bw-enabled">启用生日祝福</label>' +
         '<span class="st-bw-switch"><input type="checkbox" id="st-bw-enabled"' + (settings.enabled ? ' checked' : '') + '></span>' +
-        '<span class="st-bw-toggle-tip">' + (settings.enabled ? '已启用' : '已停用（不再自动弹祝福）') + '</span></div>' +
+        '<span class="st-bw-toggle-tip" id="st-bw-enabled-tip">' + (settings.enabled ? '已启用' : '已停用（不再自动弹祝福）') + '</span></div>' +
         '<div class="st-bw-row"><label>我的生日</label><input type="date" id="st-bw-birthday" value="' + escapeHtml(settings.birthday) + '"></div>' +
-        '<div class="st-bw-row st-bw-toggle"><label>使用酒馆主 API</label>' +
+        '<div class="st-bw-row st-bw-toggle"><label for="st-bw-usemain">使用酒馆主 API</label>' +
         '<span class="st-bw-switch"><input type="checkbox" id="st-bw-usemain"' + (settings.useMain ? ' checked' : '') + '></span>' +
         '<span class="st-bw-toggle-tip">复用酒馆主连接，副 API 不填</span></div>' +
         '<div class="st-bw-row" id="st-bw-row-baseurl"><label>API Base URL（副 API）</label><input type="text" id="st-bw-baseurl" placeholder="https://api.example.com" value="' + escapeHtml(settings.baseUrl) + '"></div>' +
@@ -323,6 +323,9 @@ function openPanel() {
         $panel.find('#st-bw-row-baseurl, #st-bw-row-apikey, #st-bw-row-model').toggle(!useMain);
     };
     $panel.on('click.stbwAct', '#st-bw-usemain', syncRows);
+    $panel.on('change.stbwAct', '#st-bw-enabled', function () {
+        $panel.find('#st-bw-enabled-tip').text($(this).is(':checked') ? '已启用' : '已停用（不再自动弹祝福）');
+    });
     $panel.on('click.stbwAct', '#st-bw-fetch-models', async function () {
         const baseUrl = String($panel.find('#st-bw-baseurl').val() || '').trim();
         const apiKey = String($panel.find('#st-bw-apikey').val() || '').trim();
@@ -426,8 +429,8 @@ if (!document.getElementById(STYLE_ID)) {
 .st-bw-row input { width:100%; box-sizing:border-box; padding:5px 8px; border-radius:6px; border:1px solid var(--SmartThemeBorderColor,#666); background:var(--SmartThemeBlurTintColor,#2a2a3a); color:var(--SmartThemeMainColor,#e0e0e0); font-size:12px; outline:none; }
 .st-bw-toggle { display:flex; align-items:center; gap:8px; }
 .st-bw-toggle label { flex:1; margin:0; }
-.st-bw-switch { position:relative; width:34px; height:18px; flex-shrink:0; }
-.st-bw-switch input { opacity:0; width:0; height:0; position:absolute; }
+.st-bw-switch { position:relative; width:34px; height:18px; flex-shrink:0; cursor:pointer; }
+.st-bw-switch input { opacity:0; position:absolute; inset:0; width:100%; height:100%; margin:0; cursor:pointer; z-index:2; }
 .st-bw-switch::after { content:''; position:absolute; inset:0; border-radius:18px; background:#444; transition:.2s; }
 .st-bw-switch:has(input:checked)::after { background:#E8C9A0; }
 .st-bw-switch::before { content:''; position:absolute; top:2px; left:2px; width:14px; height:14px; border-radius:50%; background:#fff; z-index:1; transition:.2s; }

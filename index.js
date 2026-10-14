@@ -400,7 +400,8 @@ function saveCardPNG(char, wish) {
     try {
         const canvas = buildCanvasCard(char, wish);
         const a = document.createElement('a');
-        a.download = '生日祝福-' + char.name + '.png';
+        const safe = String(char.name).replace(/[\\/:*?"<>|\r\n\t]/g, '_').trim() || '角色';
+        a.download = '生日祝福-' + safe + '.png';
         a.href = canvas.toDataURL('image/png');
         document.body.appendChild(a);
         a.click();

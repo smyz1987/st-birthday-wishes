@@ -438,6 +438,12 @@ function openOverlay(list) {
         }).catch(e => {
             if (!$('#' + OVERLAY_ID).length) return;
             $inner.find('.st-bw-loading').html('⚠ ' + escapeHtml(e.message));
+            // 失败也保留翻页能力，不至于卡死在这一张
+            if (list.length > 1) {
+                $inner.append('<div class="st-bw-nav">' +
+                    '<span class="st-bw-nav-btn' + (idx === 0 ? ' disabled' : '') + '" data-nav="prev">← 上一张</span>' +
+                    '<span class="st-bw-nav-btn' + (idx === list.length - 1 ? ' disabled' : '') + '" data-nav="next">下一张 →</span></div>');
+            }
         });
         // 翻页
         $inner.find('.st-bw-close').on('click', function () { $ov.remove(); });
@@ -523,6 +529,7 @@ function openPanel() {
         $panel.find('#st-bw-row-baseurl, #st-bw-row-apikey, #st-bw-row-model').toggle(!useMain);
     };
     $panel.on('click.stbwAct', '#st-bw-usemain', syncRows);
+    syncRows();   // 打开设置面板时立即同步一次显隐
     $panel.on('change.stbwAct', '#st-bw-usemain', function () {
         settings.useMain = $(this).is(':checked');
         syncRows();
@@ -570,7 +577,8 @@ function openPanel() {
     });
     $panel.on('click.stbwAct', '#st-bw-preview', async function () {
         $panel.find('#st-bw-save, #st-bw-preview').hide();
-        $panel.append('<div class="st-bw-note">正在统计聊天记录…</div>');
+        const $note = $('<div class="st-bw-note">正在统计聊天记录…</div>');
+        $panel.append($note);
         try {
             const list = await computeStats(true);
             openOverlay(list);
@@ -578,7 +586,7 @@ function openPanel() {
             $panel.append('<div class="st-bw-note st-bw-err">⚠ ' + escapeHtml(e.message) + '</div>');
         } finally {
             $panel.find('#st-bw-save, #st-bw-preview').show();
-            $panel.find('.st-bw-note:last').remove();
+            $note.remove();
         }
     });
 }

@@ -122,7 +122,12 @@ async function genWish(char, force) {
     } else {
         const api = { baseUrl: String(settings.baseUrl || ''), apiKey: String(settings.apiKey || ''), model: String(settings.model || '') };
         if (!api.baseUrl || !api.apiKey || !api.model) {
-            return { wish: '（请在设置里配置副 API 的 Base URL / Key / 模型，或勾选「使用酒馆主 API」）', motto: '' };
+            // 未配置：返回完整兜底设计，避免卡片渲染缺字段
+            const fb = fallbackDesign(char);
+            return Object.assign({}, fb, {
+                wish: '（请在设置里配置副 API 的 Base URL / Key / 模型，或勾选「使用酒馆主 API」后重新生成）',
+                motto: '',
+            });
         }
         let url = String(api.baseUrl).trim().replace(/\/+$/, '');
         if (!/\/v\d+$/.test(url)) url += '/v1';
@@ -299,7 +304,7 @@ function cardHTML(char, obj) {
         '<div class="st-bw-card-deco">' + deco.map(function (d) { return '<span>' + escapeHtml(d) + '</span>'; }).join('') + '</div>' +
         '<div class="st-bw-card-title" style="color:' + o.accent + ';">' + escapeHtml(o.title || (char.name + ' 的赠礼')) + '</div>' +
         '<div class="st-bw-card-tag" style="color:' + o.accent + ';">' + escapeHtml(char.name) + (styleTxt ? ' · ' + escapeHtml(styleTxt) : '') + '</div>' +
-        '<div class="st-bw-card-motto">' + (o.motto ? '「' + escapeHtml(o.motto) + '」' : '') + '</div>' +
+        '<div class="st-bw-card-motto" style="color:' + body + ';">' + (o.motto ? '「' + escapeHtml(o.motto) + '」' : '') + '</div>' +
         '<div class="st-bw-card-wish" style="color:' + body + ';">' + escapeHtml(o.wish || '') + '</div>' +
         '<div class="st-bw-card-from" style="color:' + o.accent + ';">—— ' + escapeHtml(char.name) + '</div>' +
         '<div class="st-bw-card-actions">' +
@@ -414,8 +419,7 @@ function openOverlay(list) {
     const $inner = $('<div class="st-bw-inner"></div>');
     $ov.append($inner);
     let idx = 0;
-    let forceRegen = false;
-    function render() {
+    function render(forceRegen) {
         const char = list[idx];
         $inner.html(
             '<div class="st-bw-close" id="st-bw-close">✕</div>' +
@@ -447,8 +451,8 @@ function openOverlay(list) {
         $inner.on('click.stbwNav', '.st-bw-act', function () {
             const act = $(this).attr('data-act');
             if (act === 'regen') {
-                forceRegen = true;
-                render();
+                // 只重新生成当前这张，翻页到别的卡不强制重生成
+                render(true);
             } else if (act === 'save') saveCardPNG(char, obj);
             else if (act === 'copy') {
                 const txt = '—— ' + char.name + ' 的生日祝福 ——\n' + (typeof obj === 'string' ? obj : (obj && obj.wish) || '');
@@ -472,6 +476,13 @@ async function triggerBirthday(force) {
     if (!isToday && !force) return { show: false, reason: '今天不是生日' };
     try {
         const list = await computeStats(force);
+        // 启动初期角色库可能还没加载完：算出来为空且角色列表为空 → 稍后重试一次，避免误报"没聊过"
+        if (!force && !list.length && (!getContext() || !getContext().characters || !getContext().characters.length)) {
+            setTimeout(function () {
+                if (settings.enabled) triggerBirthday(false);
+            }, 12000);
+            return { show: false, reason: '角色库加载中，稍后重试' };
+        }
         openOverlay(list);
         return { show: true, count: list.length };
     } catch (e) {
@@ -662,7 +673,7 @@ if (!document.getElementById(STYLE_ID)) {
 .st-bw-card-title::before { left:calc(50% - 118px); }
 .st-bw-card-title::after { right:calc(50% - 118px); }
 .st-bw-card-tag { position:relative; text-align:center; font-size:12px; font-weight:700; margin-bottom:8px; opacity:.92; }
-.st-bw-card-motto { position:relative; text-align:center; font-size:17px; font-weight:700; margin-bottom:12px; min-height:24px; }
+.st-bw-card-motto { position:relative; text-align:center; font-size:17px; font-weight:700; margin-bottom:12px; min-height:24px; color:#f2e2e6; }
 .st-bw-card-from { position:relative; text-align:center; font-size:15px; font-weight:700; margin:12px 0 2px; }
 .st-bw-card-wish { position:relative; font-size:15px; line-height:1.7; text-align:center; word-break:break-all; }
 .st-bw-card-actions { position:relative; display:flex; justify-content:center; gap:12px; margin-top:12px; }

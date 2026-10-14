@@ -1,8 +1,8 @@
 {
     "display_name": "🎂 生日祝福",
-    "js": "index.js?v=1.0.3",
+    "js": "index.js?v=1.1.0",
     "author": "smyz1987",
-    "version": "1.0.3",
+    "version": "1.1.0",
     "description": "设定你的生日：聊过 10 条以上消息的角色，会在你生日当天进入酒馆时以各自的口吻送上祝福卡片，可保存图片或复制文字。",
     "requires": []
 }

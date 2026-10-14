@@ -9,7 +9,7 @@ const LS_STATS = 'st-bw-stats';         // { date: 'M-D', list: [{avatar,name,co
 const OVERLAY_ID = 'st-bw-overlay';
 const WAND_ID = 'st-bw-wand';
 
-let settings = { birthday: '', baseUrl: '', apiKey: '', model: '', threshold: 10 };
+let settings = { enabled: true, useMain: false, birthday: '', baseUrl: '', apiKey: '', model: '', threshold: 10 };
 
 function loadSettings() {
     try { settings = Object.assign(settings, JSON.parse(localStorage.getItem(LS_SETTINGS) || '{}')); } catch { /* ignore */ }
@@ -70,24 +70,63 @@ async function computeStats(force) {
 }
 
 // ---------- LLM 生成祝福 ----------
+// 主 API：复用酒馆当前主 API（OpenAI 兼容源）
+function resolveApi() {
+    if (settings.useMain) {
+        try {
+            const o = typeof oai_settings !== 'undefined' ? oai_settings : null;
+            const baseUrl = (o && o.chat_completion_proxy_url) || '';
+            const apiKey = (o && o.oai_api_key) || '';
+            let model = '';
+            if (o && o.models && Array.isArray(o.models)) {
+                const idx = Number(o.custom_model);
+                model = o.models[idx] || o.models[0] || '';
+            }
+            return { baseUrl: String(baseUrl), apiKey: String(apiKey), model: String(model), src: 'main' };
+        } catch { /* fall through */ }
+        return { baseUrl: '', apiKey: '', model: '', src: 'main' };
+    }
+    return { baseUrl: String(settings.baseUrl || ''), apiKey: String(settings.apiKey || ''), model: String(settings.model || ''), src: 'custom' };
+}
+
+// 拉取模型列表（OpenAI 兼容 /models 接口）
+async function fetchModels(baseUrl, apiKey) {
+    let url = String(baseUrl || '').trim().replace(/\/+$/, '');
+    if (!url) return [];
+    const tryUrls = /\/v\d+$/i.test(url) ? [url + '/models'] : [url + '/models', url + '/v1/models'];
+    for (const u of tryUrls) {
+        try {
+            const res = await fetch(u, { headers: { 'Authorization': 'Bearer ' + apiKey } });
+            if (!res.ok) continue;
+            const j = await res.json();
+            const models = (j && Array.isArray(j.data)) ? j.data.map(m => m && m.id).filter(Boolean) : [];
+            if (models.length) return models;
+        } catch { /* try next */ }
+    }
+    return [];
+}
+
 async function genWish(char) {
     const key = todayMD() + '|' + char.avatar;
     const cache = (() => { try { return JSON.parse(localStorage.getItem(LS_WISHES) || '{}'); } catch { return {}; } })();
     if (cache[key]) return cache[key];
-    if (!settings.baseUrl || !settings.apiKey || !settings.model) {
-        return '（请在设置里配置 API 后重新生成祝福）';
+    const api = resolveApi();
+    if (!api.baseUrl || !api.apiKey || !api.model) {
+        return api.src === 'main'
+            ? '（酒馆主 API 未配置完成，请先在主连接里设置，或改用副 API）'
+            : '（请在设置里配置 API 后重新生成祝福）';
     }
     const c = getContext().characters.find(x => String(x.avatar || (x.data && x.data.avatar)) === char.avatar);
     const desc = truncate(String((c && (c.description || (c.data && c.data.description))) || ''), 500);
     const first = truncate(String((c && (c.first_mes || (c.data && c.data.first_mes))) || ''), 300);
-    let url = String(settings.baseUrl).trim().replace(/\/+$/, '');
+    let url = String(api.baseUrl).trim().replace(/\/+$/, '');
     if (!/\/v\d+$/.test(url)) url += '/v1';
     url += '/chat/completions';
     const res = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + settings.apiKey },
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + api.apiKey },
         body: JSON.stringify({
-            model: settings.model,
+            model: api.model,
             messages: [
                 { role: 'system', content: '你正在扮演角色「' + char.name + '」。' + (desc ? '人设：' + desc : '') + (first ? '开场白：' + first : '') + '今天是用户的生日。请完全以「' + char.name + '」的身份、用符合 TA 性格的口吻写一句生日祝福，60-120字，要有角色特色（称呼、语气、习惯），不要提到AI/模型/扮演。只输出祝福本身。' },
                 { role: 'user', content: '今天是我生日，祝我生日快乐吧。' },
@@ -251,17 +290,25 @@ async function triggerBirthday(force) {
     }
 }
 
-// ---------- 悬浮按钮 & 设置 ----------
+// ---------- 魔法棒入口 & 设置 ----------
 function buildSettingsHTML() {
     return '<div class="st-bw-title">🎂 生日祝福 · 设置</div>' +
+        '<div class="st-bw-row st-bw-toggle"><label>启用生日祝福</label>' +
+        '<span class="st-bw-switch"><input type="checkbox" id="st-bw-enabled"' + (settings.enabled ? ' checked' : '') + '></span>' +
+        '<span class="st-bw-toggle-tip">' + (settings.enabled ? '已启用' : '已停用（不再自动弹祝福）') + '</span></div>' +
         '<div class="st-bw-row"><label>我的生日</label><input type="date" id="st-bw-birthday" value="' + escapeHtml(settings.birthday) + '"></div>' +
-        '<div class="st-bw-row"><label>API Base URL</label><input type="text" id="st-bw-baseurl" placeholder="https://api.example.com" value="' + escapeHtml(settings.baseUrl) + '"></div>' +
-        '<div class="st-bw-row"><label>API Key</label><input type="password" id="st-bw-apikey" placeholder="sk-..." value="' + escapeHtml(settings.apiKey) + '"></div>' +
-        '<div class="st-bw-row"><label>模型</label><input type="text" id="st-bw-model" placeholder="gpt-4o-mini / gemini-..." value="' + escapeHtml(settings.model) + '"></div>' +
+        '<div class="st-bw-row st-bw-toggle"><label>使用酒馆主 API</label>' +
+        '<span class="st-bw-switch"><input type="checkbox" id="st-bw-usemain"' + (settings.useMain ? ' checked' : '') + '></span>' +
+        '<span class="st-bw-toggle-tip">复用酒馆主连接，副 API 不填</span></div>' +
+        '<div class="st-bw-row" id="st-bw-row-baseurl"><label>API Base URL（副 API）</label><input type="text" id="st-bw-baseurl" placeholder="https://api.example.com" value="' + escapeHtml(settings.baseUrl) + '"></div>' +
+        '<div class="st-bw-row" id="st-bw-row-apikey"><label>API Key（副 API）</label><input type="password" id="st-bw-apikey" placeholder="sk-..." value="' + escapeHtml(settings.apiKey) + '"></div>' +
+        '<div class="st-bw-row" id="st-bw-row-model"><label>模型 <span class="st-bw-mini-btn" id="st-bw-fetch-models">🔄 自动拉取</span></label>' +
+        '<input type="text" id="st-bw-model" list="st-bw-models" placeholder="gpt-4o-mini / gemini-..." value="' + escapeHtml(settings.model) + '">' +
+        '<datalist id="st-bw-models"></datalist></div>' +
         '<div class="st-bw-row"><label>聊过多少条才算（默认 10）</label><input type="number" id="st-bw-threshold" min="1" max="999" value="' + Number(settings.threshold) + '"></div>' +
         '<div class="st-bw-btn-row"><span class="st-bw-act-btn" id="st-bw-save">保存设置</span>' +
         '<span class="st-bw-act-btn" id="st-bw-preview">预览祝福（现在生成）</span></div>' +
-        '<div class="st-bw-note">生日当天进入酒馆会自动弹出祝福。预览会立即统计并生成祝福（消耗 API 额度）。</div>';
+        '<div class="st-bw-note">生日当天进入酒馆会自动弹出祝福（停用时不弹）。预览会立即统计并生成祝福（消耗 API 额度）。勾选「使用酒馆主 API」则复用主连接，否则用副 API。</div>';
 }
 
 function openPanel() {
@@ -271,13 +318,35 @@ function openPanel() {
     $panel.html(buildSettingsHTML());
     $('body').append($panel);
     $panel.on('mousedown.stbw touchstart.stbw', function (e) { e.stopPropagation(); });
+    const syncRows = function () {
+        const useMain = $panel.find('#st-bw-usemain').is(':checked');
+        $panel.find('#st-bw-row-baseurl, #st-bw-row-apikey, #st-bw-row-model').toggle(!useMain);
+    };
+    $panel.on('click.stbwAct', '#st-bw-usemain', syncRows);
+    $panel.on('click.stbwAct', '#st-bw-fetch-models', async function () {
+        const baseUrl = String($panel.find('#st-bw-baseurl').val() || '').trim();
+        const apiKey = String($panel.find('#st-bw-apikey').val() || '').trim();
+        const $tip = $(this);
+        if (!baseUrl || !apiKey) { $tip.text('⚠ 先填 Base URL / Key'); return; }
+        $tip.text('⏳ 拉取中…');
+        try {
+            const models = await fetchModels(baseUrl, apiKey);
+            const $dl = $panel.find('#st-bw-models');
+            $dl.empty();
+            models.forEach(m => $dl.append('<option value="' + escapeHtml(m) + '">'));
+            $tip.text(models.length ? '✅ 已拉取 ' + models.length + ' 个' : '⚠ 未获取到模型');
+        } catch { $tip.text('⚠ 拉取失败'); }
+    });
     $panel.on('click.stbwAct', '#st-bw-save', function () {
+        settings.enabled = $panel.find('#st-bw-enabled').is(':checked');
+        settings.useMain = $panel.find('#st-bw-usemain').is(':checked');
         settings.birthday = String($panel.find('#st-bw-birthday').val() || '').trim();
         settings.baseUrl = String($panel.find('#st-bw-baseurl').val() || '').trim();
         settings.apiKey = String($panel.find('#st-bw-apikey').val() || '').trim();
         settings.model = String($panel.find('#st-bw-model').val() || '').trim();
         settings.threshold = Math.max(1, Number($panel.find('#st-bw-threshold').val()) || 10);
         saveSettings();
+        refreshWandState();
         $panel.append('<div class="st-bw-note st-bw-ok">✓ 已保存</div>');
     });
     $panel.on('click.stbwAct', '#st-bw-preview', async function () {
@@ -296,6 +365,20 @@ function openPanel() {
 }
 
 // ---------- 魔法棒菜单入口注入 ----------
+function refreshWandState() {
+    const el = document.getElementById(WAND_ID);
+    if (!el) return;
+    if (settings.enabled) {
+        el.style.opacity = '1';
+        el.textContent = '🎂 生日祝福';
+        el.title = '🎂 生日祝福设置 / 预览';
+    } else {
+        el.style.opacity = '.45';
+        el.textContent = '🎂 生日祝福（已停用）';
+        el.title = '已停用。点击打开设置可重新启用';
+    }
+}
+
 function injectButton() {
     const menu = document.getElementById('extensionsMenu');
     if (!menu || document.getElementById(WAND_ID)) return;
@@ -303,22 +386,24 @@ function injectButton() {
     el.id = WAND_ID;
     el.className = 'list-group-item flex-container flexGap5 interactable';
     el.setAttribute('tabindex', '0');
-    el.title = '🎂 生日祝福设置 / 预览';
-    el.textContent = '🎂 生日祝福';
     el.addEventListener('click', function (e) {
         e.preventDefault();
         e.stopPropagation();
         openPanel();
     });
     menu.appendChild(el);
+    refreshWandState();
 }
 
 $(function () {
     injectButton();
-    setInterval(function () { if (!document.getElementById(WAND_ID)) injectButton(); }, 3000);
-    // 进入酒馆自动检测生日
+    setInterval(function () {
+        if (!document.getElementById(WAND_ID)) injectButton();
+        else refreshWandState();
+    }, 3000);
+    // 进入酒馆自动检测生日（停用时不弹）
     setTimeout(function () {
-        if (settings.birthday) triggerBirthday(false);
+        if (settings.enabled && settings.birthday) triggerBirthday(false);
     }, 4000);
 });
 
@@ -339,6 +424,17 @@ if (!document.getElementById(STYLE_ID)) {
 .st-bw-row { margin-bottom:8px; }
 .st-bw-row label { display:block; font-size:12px; opacity:.8; margin-bottom:2px; }
 .st-bw-row input { width:100%; box-sizing:border-box; padding:5px 8px; border-radius:6px; border:1px solid var(--SmartThemeBorderColor,#666); background:var(--SmartThemeBlurTintColor,#2a2a3a); color:var(--SmartThemeMainColor,#e0e0e0); font-size:12px; outline:none; }
+.st-bw-toggle { display:flex; align-items:center; gap:8px; }
+.st-bw-toggle label { flex:1; margin:0; }
+.st-bw-switch { position:relative; width:34px; height:18px; flex-shrink:0; }
+.st-bw-switch input { opacity:0; width:0; height:0; position:absolute; }
+.st-bw-switch::after { content:''; position:absolute; inset:0; border-radius:18px; background:#444; transition:.2s; }
+.st-bw-switch:has(input:checked)::after { background:#E8C9A0; }
+.st-bw-switch::before { content:''; position:absolute; top:2px; left:2px; width:14px; height:14px; border-radius:50%; background:#fff; z-index:1; transition:.2s; }
+.st-bw-switch:has(input:checked)::before { transform:translateX(16px); }
+.st-bw-toggle-tip { font-size:11px; opacity:.7; flex-shrink:0; }
+.st-bw-mini-btn { display:inline-block; padding:2px 8px; border-radius:12px; cursor:pointer; font-size:11px; background:rgba(232,201,160,.2); color:#E8C9A0; margin-left:6px; }
+.st-bw-mini-btn:hover { background:rgba(232,201,160,.35); }
 .st-bw-note { font-size:12px; opacity:.75; margin:6px 0; }
 .st-bw-ok { color:#A9C3A0; }
 .st-bw-err { color:#E88; }

@@ -1,7 +1,7 @@
 // st-birthday-wishes: 生日祝福
 // 设定生日日期；聊过 ≥N 条消息的角色在生日当天进入酒馆时，以各自口吻送上祝福卡片（可保存图片/复制文字）
 import { getContext } from '../../../extensions.js';
-import { getRequestHeaders } from '../../../../script.js';
+import { getRequestHeaders, generateQuietPrompt } from '../../../../script.js';
 
 const LS_SETTINGS = 'st-bw-settings';
 const LS_WISHES = 'st-bw-wishes';       // { '月-日|avatar': '祝福文本' }
@@ -70,23 +70,18 @@ async function computeStats(force) {
 }
 
 // ---------- LLM 生成祝福 ----------
-// 主 API：复用酒馆当前主 API（OpenAI 兼容源）
-function resolveApi() {
-    if (settings.useMain) {
-        try {
-            const o = typeof oai_settings !== 'undefined' ? oai_settings : null;
-            const baseUrl = (o && o.chat_completion_proxy_url) || '';
-            const apiKey = (o && o.oai_api_key) || '';
-            let model = '';
-            if (o && o.models && Array.isArray(o.models)) {
-                const idx = Number(o.custom_model);
-                model = o.models[idx] || o.models[0] || '';
-            }
-            return { baseUrl: String(baseUrl), apiKey: String(apiKey), model: String(model), src: 'main' };
-        } catch { /* fall through */ }
-        return { baseUrl: '', apiKey: '', model: '', src: 'main' };
+// 主 API：直接调用酒馆官方静默生成接口，真正跟随当前主连接（支持任意主源类型）
+async function mainQuiet(promptText) {
+    if (typeof generateQuietPrompt !== 'function') {
+        throw new Error('跟随主 API 需要酒馆的静默生成接口，当前版本不可用，请改用副 API');
     }
-    return { baseUrl: String(settings.baseUrl || ''), apiKey: String(settings.apiKey || ''), model: String(settings.model || ''), src: 'custom' };
+    try {
+        const out = await generateQuietPrompt(promptText, { quietToLoud: true });
+        if (!out) throw new Error('主 API 返回为空');
+        return String(out);
+    } catch (e) {
+        throw new Error('跟随主 API 生成失败：' + (e && e.message ? e.message : e));
+    }
 }
 
 // 拉取模型列表（OpenAI 兼容 /models 接口）
@@ -106,103 +101,193 @@ async function fetchModels(baseUrl, apiKey) {
     return [];
 }
 
-async function genWish(char) {
+async function genWish(char, force) {
     const key = todayMD() + '|' + char.avatar;
     const cache = (() => { try { return JSON.parse(localStorage.getItem(LS_WISHES) || '{}'); } catch { return {}; } })();
-    if (cache[key]) return cache[key];
-    const api = resolveApi();
-    if (!api.baseUrl || !api.apiKey || !api.model) {
-        return api.src === 'main'
-            ? '（酒馆主 API 未配置完成，请先在主连接里设置，或改用副 API）'
-            : '（请在设置里配置 API 后重新生成祝福）';
-    }
+    if (!force && cache[key]) return cache[key];
     const c = getContext().characters.find(x => String(x.avatar || (x.data && x.data.avatar)) === char.avatar);
     const desc = truncate(String((c && (c.description || (c.data && c.data.description))) || ''), 500);
     const first = truncate(String((c && (c.first_mes || (c.data && c.data.first_mes))) || ''), 300);
-    let url = String(api.baseUrl).trim().replace(/\/+$/, '');
-    if (!/\/v\d+$/.test(url)) url += '/v1';
-    url += '/chat/completions';
-    const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + api.apiKey },
-        body: JSON.stringify({
-            model: api.model,
-            messages: [
-                { role: 'system', content: '你正在扮演角色「' + char.name + '」。' + (desc ? '人设：' + desc : '') + (first ? '开场白：' + first : '') + '今天是用户的生日。请完全以「' + char.name + '」的身份、用符合 TA 性格的口吻写一句生日祝福，60-120字，要有角色特色（称呼、语气、习惯），不要提到AI/模型/扮演。只输出祝福本身。' },
-                { role: 'user', content: '今天是我生日，祝我生日快乐吧。' },
-            ],
-            temperature: 0.9,
-            max_tokens: 300,
-        }),
-    });
-    if (!res.ok) {
-        let msg = 'HTTP ' + res.status;
-        try { const j = await res.json(); msg += ': ' + (j.error && (j.error.message || j.error)) || ''; } catch { /* ignore */ }
-        throw new Error(msg);
+    const sys = '你正在扮演角色「' + char.name + '」。' + (desc ? '人设：' + desc : '') + (first ? '开场白：' + first : '') + '今天是用户的生日。请完全以「' + char.name + '」的身份，像 TA 真的对在乎的人说话那样：\n【祝福】写一段 60-140 字的生日祝福，内容必须人设专属：结合 TA 的性格、说话习惯、称呼方式、职业/身份、可能送的礼物或做的事。绝对禁止只写"生日快乐"四个字，禁止套话。\n【角色语】另写一句 10-20 字、只有 TA 会说的话（TA 的口头禅、人生信条、或 TA 最想对你说的一句话，要贴合人设与生日主题）。\n不要提到 AI/模型/扮演，不要解释。严格按下面格式输出：\n【祝福】\n<祝福内容>\n【角色语】\n<那句话>';
+    const usr = '今天是我生日。你会对我说什么？';
+    let raw;
+    if (settings.useMain) {
+        raw = await mainQuiet(sys + '\n\n' + usr);
+    } else {
+        const api = { baseUrl: String(settings.baseUrl || ''), apiKey: String(settings.apiKey || ''), model: String(settings.model || '') };
+        if (!api.baseUrl || !api.apiKey || !api.model) {
+            return { wish: '（请在设置里配置副 API 的 Base URL / Key / 模型，或勾选「使用酒馆主 API」）', motto: '' };
+        }
+        let url = String(api.baseUrl).trim().replace(/\/+$/, '');
+        if (!/\/v\d+$/.test(url)) url += '/v1';
+        url += '/chat/completions';
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + api.apiKey },
+            body: JSON.stringify({
+                model: api.model,
+                messages: [
+                    { role: 'system', content: sys },
+                    { role: 'user', content: usr },
+                ],
+                temperature: 0.95,
+                max_tokens: 500,
+            }),
+        });
+        if (!res.ok) {
+            let msg = 'HTTP ' + res.status;
+            try { const j = await res.json(); msg += ': ' + (j.error && (j.error.message || j.error)) || ''; } catch { /* ignore */ }
+            throw new Error(msg);
+        }
+        const j = await res.json();
+        const text = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
+        if (!text) throw new Error('API 返回为空');
+        raw = String(text).trim();
     }
-    const j = await res.json();
-    const text = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
-    if (!text) throw new Error('API 返回为空');
-    const wish = String(text).trim();
-    cache[key] = wish;
+    // 解析【祝福】/【角色语】
+    let wish = raw, motto = '';
+    const mW = raw.match(/【祝福】\s*([\s\S]*?)(?=【角色语】|$)/);
+    const mM = raw.match(/【角色语】\s*([\s\S]+)/);
+    if (mW && mW[1]) wish = mW[1].trim();
+    if (mM && mM[1]) motto = mM[1].trim().replace(/^[「"']+|[」"']+$/g, '');
+    const out = { wish, motto };
+    cache[key] = out;
     localStorage.setItem(LS_WISHES, JSON.stringify(cache));
-    return wish;
+    return out;
+}
+
+// 根据角色人设/标签推断卡片主题（配色 + 装饰物），并加入角色名微调让每张卡独一无二
+function cardTheme(char) {
+    const hay = String(char.name + ' ' + (char.tags ? char.tags.join(' ') : '') + ' ' + (char.description || '')).toLowerCase();
+    const themes = [
+        { id: 'sweet', label: '甜宠', g1: '#F9E4E4', g2: '#F2D9B8', accent: '#D9A7A7', accentDark: '#B06060', emoji: '🎀', deco: ['🎀', '🍰', '💐'], mottoD: '想把你捧在手心', keywords: ['甜', '宠', '恋爱', '软萌', '治愈', '温柔', '阳光', '爱', '恋', '公主', '哥哥', '黏人'] },
+        { id: 'dark', label: '暗夜', g1: '#2a1515', g2: '#4a1f1f', accent: '#B03030', accentDark: '#E06060', emoji: '🩸', deco: ['🩸', '🕯️', '🥀'], mottoD: '你属于我，仅此一天', keywords: ['黑暗', '血腥', '虐', '病娇', '扭曲', '疯狂', '绝望', '阴郁', '残酷', '深渊', '恶魔', '血', '疯批', '疯'] },
+        { id: 'mystery', label: '悬疑', g1: '#151d2e', g2: '#26354d', accent: '#7aa2d0', accentDark: '#c0d8f0', emoji: '🔍', deco: ['🔍', '🕰️', '🗝️'], mottoD: '秘密，我只告诉你一个', keywords: ['悬疑', '侦探', '谜', '案件', '秘密', '推理', '阴谋', '调查', '真相', '诡', '失踪'] },
+        { id: 'scifi', label: '科幻', g1: '#0f1a26', g2: '#1c3540', accent: '#4fc3e8', accentDark: '#a8e6ff', emoji: '🚀', deco: ['🚀', '🛰️', '⚙️'], mottoD: '信号会穿越星海找到你', keywords: ['科幻', '未来', '机器人', '宇宙', '赛博', '机械', '科技', '仿生', '太空', '代码', 'ai', '仿生人'] },
+        { id: 'fantasy', label: '奇幻', g1: '#221730', g2: '#3a2750', accent: '#9a7ad0', accentDark: '#d8c4f0', emoji: '🔮', deco: ['🔮', '⚔️', '🐉'], mottoD: '为你许下一个魔法契约', keywords: ['魔法', '奇幻', '异世界', '勇者', '精灵', '龙', '巫师', '炼金', '剑', '魔女', '骑士'] },
+        { id: 'nature', label: '草木', g1: '#14231a', g2: '#27452b', accent: '#7fc07a', accentDark: '#c8e8c0', emoji: '🌿', deco: ['🌿', '🍃', '🌼'], mottoD: '想带你去闻一闻风', keywords: ['治愈', '植物', '森林', '猫咪', '自然', '花', '山', '海', '风', '光', '安静', '毛茸茸'] },
+        { id: 'warm', label: '日常', g1: '#2e2415', g2: '#4a3a20', accent: '#d0b078', accentDark: '#f0e0b0', emoji: '☕', deco: ['☕', '📖', '🪴'], mottoD: '今天也一起回家吧', keywords: ['日常', '生活', '室友', '校园', '朋友', '温馨', '陪伴', '邻居', '同学'] },
+    ];
+    let best = themes[0], bestScore = 0;
+    for (const t of themes) {
+        let s = 0;
+        for (const k of t.keywords) if (hay.includes(k)) s++;
+        if (s > bestScore) { bestScore = s; best = t; }
+    }
+    // 角色名哈希 → 微调两个渐变色的色相，让每张卡都有细微差别
+    let h = 0;
+    for (let i = 0; i < char.name.length; i++) h = (h * 31 + char.name.charCodeAt(i)) >>> 0;
+    const shift = (h % 18) - 9;
+    best.hue = shift;
+    return best;
+}
+
+function hueShift(hex, deg) {
+    try {
+        const m = hex.match(/^#([0-9a-f]{6})$/i);
+        if (!m || !deg) return hex;
+        let r = parseInt(m[1].slice(0, 2), 16) / 255, g = parseInt(m[1].slice(2, 4), 16) / 255, b = parseInt(m[1].slice(4, 6), 16) / 255;
+        const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+        let h = 0, s = 0, l = (mx + mn) / 2;
+        const d = mx - mn;
+        if (d) {
+            s = l > .5 ? d / (2 - mx - mn) : d / (mx + mn);
+            if (mx === r) h = ((g - b) / d + (g < b ? 6 : 0)) % 6;
+            else if (mx === g) h = (b - r) / d + 2;
+            else h = (r - g) / d + 4;
+            h *= 60;
+        }
+        h = ((h + deg) % 360 + 360) % 360;
+        const c = (1 - Math.abs(2 * l - 1)) * s, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m2 = l - c / 2;
+        let rr = 0, gg = 0, bb = 0;
+        if (h < 60) { rr = c; gg = x; }
+        else if (h < 120) { rr = x; gg = c; }
+        else if (h < 180) { gg = c; bb = x; }
+        else if (h < 240) { gg = x; bb = c; }
+        else if (h < 300) { rr = x; bb = c; }
+        else { rr = c; bb = x; }
+        const to = v => Math.round((v + m2) * 255).toString(16).padStart(2, '0');
+        return '#' + to(rr) + to(gg) + to(bb);
+    } catch { return hex; }
 }
 
 // ---------- 卡片渲染 & 保存 ----------
-function cardHTML(char, wish) {
-    const firstLine = '🎂 生日快乐 🎂';
-    return '<div class="st-bw-card" data-avatar="' + escapeHtml(char.avatar) + '">' +
-        '<div class="st-bw-card-top">' + firstLine + '</div>' +
-        '<div class="st-bw-card-from">—— ' + escapeHtml(char.name) + '</div>' +
-        '<div class="st-bw-card-wish">' + escapeHtml(wish) + '</div>' +
+function cardHTML(char, obj) {
+    const t = cardTheme(char);
+    const wish = typeof obj === 'string' ? obj : (obj && obj.wish) || '';
+    const motto = typeof obj === 'string' ? '' : (obj && obj.motto) || '';
+    const g1 = hueShift(t.g1, t.hue), g2 = hueShift(t.g2, t.hue);
+    return '<div class="st-bw-card" data-avatar="' + escapeHtml(char.avatar) + '" style="background:linear-gradient(135deg,' + g1 + ',' + g2 + ');border:1px solid ' + t.accent + ';">' +
+        '<div class="st-bw-card-deco">' + t.deco.map(function (d) { return '<span>' + d + '</span>'; }).join('') + '</div>' +
+        '<div class="st-bw-card-tag" style="color:' + t.accentDark + ';">' + escapeHtml(t.label) + '系 · ' + escapeHtml(char.name) + '</div>' +
+        '<div class="st-bw-card-motto">' + (motto ? '「' + escapeHtml(motto) + '」' : escapeHtml(t.mottoD)) + '</div>' +
+        '<div class="st-bw-card-wish" style="color:' + (t.id === 'dark' ? '#f0d0d0' : '#5a3a3a') + ';">' + escapeHtml(wish) + '</div>' +
+        '<div class="st-bw-card-from" style="color:' + t.accentDark + ';">—— ' + escapeHtml(char.name) + '</div>' +
         '<div class="st-bw-card-actions">' +
+        '<span class="st-bw-act" data-act="regen">🔄 重新生成</span>' +
         '<span class="st-bw-act" data-act="save">💾 保存图片</span>' +
         '<span class="st-bw-act" data-act="copy">📋 复制文字</span>' +
         '</div></div>';
 }
 
-function buildCanvasCard(char, wish, size) {
+function buildCanvasCard(char, obj, size) {
     const W = 600, H = 360;
+    const t = cardTheme(char);
+    const wish = typeof obj === 'string' ? obj : (obj && obj.wish) || '';
+    const motto = typeof obj === 'string' ? '' : (obj && obj.motto) || '';
+    const g1 = hueShift(t.g1, t.hue), g2 = hueShift(t.g2, t.hue);
     const canvas = document.createElement('canvas');
     canvas.width = W; canvas.height = H;
     const g = canvas.getContext('2d');
-    // 背景渐变（粉→金）
+    // 背景渐变（按角色主题色 + 微调）
     const grad = g.createLinearGradient(0, 0, W, H);
-    grad.addColorStop(0, '#F9E4E4');
-    grad.addColorStop(0.55, '#F6D8D8');
-    grad.addColorStop(1, '#F2D9B8');
+    grad.addColorStop(0, g1);
+    grad.addColorStop(0.55, g2);
+    grad.addColorStop(1, g1);
     g.fillStyle = grad;
     g.fillRect(0, 0, W, H);
-    // 装饰：蛋糕简笔 + 气球
-    g.fillStyle = 'rgba(217,167,167,.55)';
+    // 装饰圆（主题强调色）
+    g.fillStyle = t.accent;
+    g.globalAlpha = .55;
     g.beginPath(); g.arc(80, 90, 34, 0, Math.PI * 2); g.fill();
     g.beginPath(); g.arc(W - 80, 80, 26, 0, Math.PI * 2); g.fill();
-    g.fillStyle = 'rgba(233,196,141,.7)';
+    g.fillStyle = t.accentDark;
     g.beginPath(); g.arc(W - 90, 150, 18, 0, Math.PI * 2); g.fill();
-    g.fillStyle = 'rgba(217,167,167,.35)';
+    g.globalAlpha = .35;
     g.fillRect(40, H - 60, W - 80, 8);
-    // 标题
-    g.fillStyle = '#B06060';
-    g.font = 'bold 30px "Segoe UI", "Microsoft YaHei", sans-serif';
+    g.globalAlpha = 1;
+    // 主题装饰物（左上 + 右上 + 左下）
+    g.font = '24px "Segoe UI Emoji", "Apple Color Emoji", sans-serif';
+    g.textAlign = 'left';
+    g.fillText(t.deco[0], 26, 320);
+    g.fillText(t.deco[1], W - 96, 58);
     g.textAlign = 'center';
-    g.fillText('🎂 生日快乐 🎂', W / 2, 56);
-    // 角色名
-    g.fillStyle = '#A05050';
-    g.font = 'bold 18px "Segoe UI", "Microsoft YaHei", sans-serif';
-    g.fillText('—— ' + char.name, W / 2, 92);
+    // 主题标签 + 角色名
+    g.fillStyle = t.accentDark;
+    g.font = 'bold 14px "Segoe UI", "Microsoft YaHei", sans-serif';
+    g.fillText(t.label + '系 · ' + char.name, W / 2, 44);
+    // 角色专属句子（motto）
+    g.fillStyle = t.accent;
+    g.font = 'bold 20px "Segoe UI", "Microsoft YaHei", sans-serif';
+    g.fillText('「' + (motto || t.mottoD) + '」', W / 2, 74);
     // 祝福正文（自动换行）
-    g.fillStyle = '#5a3a3a';
+    g.fillStyle = t.id === 'dark' ? '#f0d0d0' : '#5a3a3a';
     g.font = '16px "Segoe UI", "Microsoft YaHei", sans-serif';
     const maxW = W - 80;
     const lines = wrapText(g, wish, maxW);
-    let y = 130;
-    for (const ln of lines.slice(0, 9)) { g.fillText(ln, W / 2, y); y += 26; }
+    let y = 110;
+    for (const ln of lines.slice(0, 8)) { g.fillText(ln, W / 2, y); y += 26; }
+    // 署名
+    g.fillStyle = t.accentDark;
+    g.font = 'bold 15px "Segoe UI", "Microsoft YaHei", sans-serif';
+    g.fillText('—— ' + char.name, W / 2, y + 14);
     // 底部装饰点
-    g.fillStyle = 'rgba(217,167,167,.6)';
+    g.fillStyle = t.accent;
+    g.globalAlpha = .6;
     for (let i = 0; i < 8; i++) {
         g.beginPath(); g.arc(90 + i * 62, H - 26, 4, 0, Math.PI * 2); g.fill();
     }
+    g.globalAlpha = 1;
     return canvas;
 }
 function wrapText(g, text, maxW) {
@@ -238,6 +323,7 @@ function openOverlay(list) {
     const $inner = $('<div class="st-bw-inner"></div>');
     $ov.append($inner);
     let idx = 0;
+    let forceRegen = false;
     function render() {
         const char = list[idx];
         $inner.html(
@@ -245,10 +331,10 @@ function openOverlay(list) {
             '<div class="st-bw-count">' + (idx + 1) + ' / ' + list.length + '</div>' +
             '<div class="st-bw-loading">正在请 ' + escapeHtml(char.name) + ' 写下祝福…</div>'
         );
-        genWish(char).then(wish => {
+        genWish(char, forceRegen).then(obj => {
             if (!$('#' + OVERLAY_ID).length) return;
             $inner.find('.st-bw-loading').remove();
-            $inner.append(cardHTML(char, wish));
+            $inner.append(cardHTML(char, obj));
         }).catch(e => {
             if (!$('#' + OVERLAY_ID).length) return;
             $inner.find('.st-bw-loading').html('⚠ ' + escapeHtml(e.message));
@@ -260,9 +346,12 @@ function openOverlay(list) {
         $inner.on('click.stbwNav', '.st-bw-next', function () { if (idx < list.length - 1) { idx++; render(); } });
         $inner.on('click.stbwNav', '.st-bw-act', function () {
             const act = $(this).attr('data-act');
-            if (act === 'save') saveCardPNG(char, wish);
+            if (act === 'regen') {
+                forceRegen = true;
+                render();
+            } else if (act === 'save') saveCardPNG(char, obj);
             else if (act === 'copy') {
-                const txt = '—— ' + char.name + ' 的生日祝福 ——\n' + wish;
+                const txt = '—— ' + char.name + ' 的生日祝福 ——\n' + (typeof obj === 'string' ? obj : (obj && obj.wish) || '');
                 try { navigator.clipboard.writeText(txt).then(() => alert('已复制')); }
                 catch { prompt('复制祝福文字：', txt); }
             }
@@ -352,6 +441,16 @@ function openPanel() {
         refreshWandState();
         $panel.append('<div class="st-bw-note st-bw-ok">✓ 已保存</div>');
     });
+    // 输入实时写回 settings（切换/关闭面板不丢）
+    $panel.off('input.stbwLive').on('input.stbwLive', function () {
+        settings.enabled = $panel.find('#st-bw-enabled').is(':checked');
+        settings.useMain = $panel.find('#st-bw-usemain').is(':checked');
+        settings.birthday = String($panel.find('#st-bw-birthday').val() || '').trim();
+        settings.baseUrl = String($panel.find('#st-bw-baseurl').val() || '').trim();
+        settings.apiKey = String($panel.find('#st-bw-apikey').val() || '').trim();
+        settings.model = String($panel.find('#st-bw-model').val() || '').trim();
+        settings.threshold = Math.max(1, Number($panel.find('#st-bw-threshold').val()) || 10);
+    });
     $panel.on('click.stbwAct', '#st-bw-preview', async function () {
         $panel.find('#st-bw-save, #st-bw-preview').hide();
         $panel.append('<div class="st-bw-note">正在统计聊天记录…</div>');
@@ -422,40 +521,42 @@ if (!document.getElementById(STYLE_ID)) {
     const style = document.createElement('style');
     style.id = STYLE_ID;
     style.textContent = `
-.st-bw-panel { position:fixed; top:12px; right:12px; z-index:99999; width:min(320px,calc(100vw - 24px)); max-height:80vh; overflow-y:auto; background:var(--SmartThemeBlurTintColor,#1e1e2e); color:var(--SmartThemeMainColor,#e0e0e0); border:1px solid var(--SmartThemeBorderColor,#666); border-radius:12px; padding:10px 12px; box-shadow:0 6px 24px rgba(0,0,0,.4); font-size:13px; }
-.st-bw-title { font-weight:700; margin-bottom:8px; color:#E8C9A0; }
+.st-bw-panel { position:fixed; top:12px; right:12px; z-index:99999; width:min(320px,calc(100vw - 24px)); max-height:80vh; overflow-y:auto; background:var(--SmartThemeBlurTintColor,#1e1e2e); color:#f2e2e6; border:1px solid #8B1A1A; border-radius:12px; padding:10px 12px; box-shadow:0 6px 24px rgba(0,0,0,.4); font-size:13px; }
+.st-bw-title { font-weight:700; margin-bottom:8px; color:#C41E3A; font-size:14px; }
 .st-bw-row { margin-bottom:8px; }
-.st-bw-row label { display:block; font-size:12px; opacity:.8; margin-bottom:2px; }
-.st-bw-row input { width:100%; box-sizing:border-box; padding:5px 8px; border-radius:6px; border:1px solid var(--SmartThemeBorderColor,#666); background:var(--SmartThemeBlurTintColor,#2a2a3a); color:var(--SmartThemeMainColor,#e0e0e0); font-size:12px; outline:none; }
+.st-bw-row label { display:block; font-size:12px; opacity:1; margin-bottom:2px; color:#D64545; }
+.st-bw-row input { width:100%; box-sizing:border-box; padding:5px 8px; border-radius:6px; border:1px solid #8B1A1A; background:var(--SmartThemeBlurTintColor,#2a2a3a); color:#f2e2e6; font-size:12px; outline:none; }
 .st-bw-toggle { display:flex; align-items:center; gap:8px; }
 .st-bw-toggle label { flex:1; margin:0; }
 .st-bw-switch { position:relative; width:34px; height:18px; flex-shrink:0; cursor:pointer; }
 .st-bw-switch input { opacity:0; position:absolute; inset:0; width:100%; height:100%; margin:0; cursor:pointer; z-index:2; }
 .st-bw-switch::after { content:''; position:absolute; inset:0; border-radius:18px; background:#444; transition:.2s; }
-.st-bw-switch:has(input:checked)::after { background:#E8C9A0; }
+.st-bw-switch:has(input:checked)::after { background:#8B1A1A; }
 .st-bw-switch::before { content:''; position:absolute; top:2px; left:2px; width:14px; height:14px; border-radius:50%; background:#fff; z-index:1; transition:.2s; }
 .st-bw-switch:has(input:checked)::before { transform:translateX(16px); }
-.st-bw-toggle-tip { font-size:11px; opacity:.7; flex-shrink:0; }
-.st-bw-mini-btn { display:inline-block; padding:2px 8px; border-radius:12px; cursor:pointer; font-size:11px; background:rgba(232,201,160,.2); color:#E8C9A0; margin-left:6px; }
-.st-bw-mini-btn:hover { background:rgba(232,201,160,.35); }
-.st-bw-note { font-size:12px; opacity:.75; margin:6px 0; }
+.st-bw-toggle-tip { font-size:11px; opacity:.9; flex-shrink:0; color:#E88383; }
+.st-bw-mini-btn { display:inline-block; padding:2px 8px; border-radius:12px; cursor:pointer; font-size:11px; background:rgba(139,26,26,.35); color:#E88383; margin-left:6px; }
+.st-bw-mini-btn:hover { background:rgba(139,26,26,.55); }
+.st-bw-note { font-size:12px; opacity:.9; margin:6px 0; color:#E88383; }
 .st-bw-ok { color:#A9C3A0; }
 .st-bw-err { color:#E88; }
 .st-bw-btn-row { display:flex; gap:8px; margin:8px 0; flex-wrap:wrap; }
-.st-bw-act-btn { padding:6px 14px; border-radius:20px; cursor:pointer; font-size:13px; background:#E8C9A0; color:#4a3a2a; font-weight:700; }
-.st-bw-act-btn:hover { filter:brightness(1.08); }
+.st-bw-act-btn { padding:6px 14px; border-radius:20px; cursor:pointer; font-size:13px; background:#8B1A1A; color:#fff; font-weight:700; }
+.st-bw-act-btn:hover { filter:brightness(1.15); }
 .st-bw-overlay { position:fixed; inset:0; z-index:100000; background:rgba(0,0,0,.55); display:flex; align-items:center; justify-content:center; }
 .st-bw-inner { position:relative; width:min(480px,calc(100vw - 40px)); max-height:85vh; overflow-y:auto; }
-.st-bw-close { position:absolute; top:10px; right:14px; z-index:2; font-size:20px; cursor:pointer; color:#8a6a6a; opacity:.8; }
-.st-bw-count { text-align:center; font-size:12px; opacity:.8; margin-bottom:6px; color:#8a6a6a; }
-.st-bw-loading { text-align:center; padding:40px 0; color:#8a6a6a; }
-.st-bw-card { background:linear-gradient(135deg,#F9E4E4,#F6D8D8 55%,#F2D9B8); border-radius:16px; padding:26px 22px; color:#5a3a3a; box-shadow:0 8px 30px rgba(0,0,0,.35); border:1px solid rgba(255,255,255,.5); }
-.st-bw-card-top { text-align:center; font-size:24px; font-weight:700; color:#B06060; margin-bottom:6px; }
-.st-bw-card-from { text-align:center; font-size:16px; font-weight:700; color:#A05050; margin-bottom:14px; }
+.st-bw-close { position:absolute; top:10px; right:14px; z-index:2; font-size:20px; cursor:pointer; color:#E88383; opacity:.9; }
+.st-bw-count { text-align:center; font-size:12px; opacity:.9; margin-bottom:6px; color:#E88383; }
+.st-bw-loading { text-align:center; padding:40px 0; color:#E88383; }
+.st-bw-card { border-radius:16px; padding:22px 22px 14px; box-shadow:0 8px 30px rgba(0,0,0,.35); }
+.st-bw-card-deco { display:flex; justify-content:center; gap:14px; font-size:22px; margin-bottom:8px; }
+.st-bw-card-tag { text-align:center; font-size:12px; font-weight:700; margin-bottom:6px; opacity:.9; }
+.st-bw-card-motto { text-align:center; font-size:17px; font-weight:700; margin-bottom:12px; min-height:24px; }
+.st-bw-card-from { text-align:center; font-size:15px; font-weight:700; margin:12px 0 2px; }
 .st-bw-card-wish { font-size:15px; line-height:1.7; text-align:center; word-break:break-all; }
-.st-bw-card-actions { display:flex; justify-content:center; gap:12px; margin-top:18px; }
-.st-bw-act { padding:6px 14px; border-radius:20px; cursor:pointer; font-size:12px; background:rgba(255,255,255,.65); color:#7a4a4a; font-weight:700; }
-.st-bw-act:hover { background:rgba(255,255,255,.9); }
+.st-bw-card-actions { display:flex; justify-content:center; gap:12px; margin-top:12px; }
+.st-bw-act { padding:6px 14px; border-radius:20px; cursor:pointer; font-size:12px; background:rgba(139,26,26,.35); color:#f2e2e6; font-weight:700; border:1px solid rgba(255,255,255,.25); }
+.st-bw-act:hover { background:rgba(139,26,26,.55); }
 `;
     document.head.appendChild(style);
 }

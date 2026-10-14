@@ -76,7 +76,11 @@ async function mainQuiet(promptText) {
         throw new Error('跟随主 API 需要酒馆的静默生成接口，当前版本不可用，请改用副 API');
     }
     try {
-        const out = await generateQuietPrompt(promptText, { quietToLoud: true });
+        // 主 API 无响应时不能无限等待——90 秒超时并给出明确提示
+        const out = await Promise.race([
+            generateQuietPrompt(promptText, { quietToLoud: true }),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('主 API 响应超时（90秒）——请检查酒馆主 API 是否已连接（发送框不应显示"未连接到 API"），或改用副 API')), 90000)),
+        ]);
         if (!out) throw new Error('主 API 返回为空');
         return String(out);
     } catch (e) {
@@ -110,7 +114,7 @@ async function genWish(char, force) {
     const c = getContext().characters.find(x => String(x.avatar || (x.data && x.data.avatar)) === char.avatar);
     const desc = truncate(String((c && (c.description || (c.data && c.data.description))) || ''), 500);
     const first = truncate(String((c && (c.first_mes || (c.data && c.data.first_mes))) || ''), 300);
-    const sys = '为角色「' + char.name + '」设计一张生日卡片（今天是我的生日）。角色资料：' + (desc ? '人设：' + desc : '') + (first ? '开场白：' + first : '') + '。\n请以角色本人视角完成以下全部内容，每一部分都必须贴合这个角色的性格、身份、世界观，绝对禁止模板化、套话：\n1) wish：60-140字的生日祝福，人设专属，绝对禁止只写"生日快乐"四个字；\n2) motto：一句只有TA会说的生日句子（口头禅/人生信条/最想对我说的话，10-20字）；\n3) title：卡片标题短语（4-10字，人设专属，如「深渊的贺礼」「来自星海的信号」）；\n4) bg1、bg2：两个十六进制颜色，组成卡片渐变背景，要贴合角色世界观色调；\n5) accent：一个十六进制强调色（装饰与署名用，要比背景亮）；\n6) deco：3-5个贴合角色气质的装饰emoji。\n不要任何解释，只输出一个 JSON 对象，严格如下格式：\n{"wish":"...","motto":"...","title":"...","bg1":"#xxxxxx","bg2":"#xxxxxx","accent":"#xxxxxx","deco":["...","..."]}';
+    const sys = '为角色「' + char.name + '」设计一张生日卡片（今天是我的生日）。角色资料：' + (desc ? '人设：' + desc : '') + (first ? '开场白：' + first : '') + '。\n请以角色本人视角完成以下全部内容，每一部分都必须贴合这个角色的性格、身份、世界观，绝对禁止模板化、套话：\n1) wish：60-140字的生日祝福，人设专属，绝对禁止只写"生日快乐"四个字；\n2) motto：一句只有TA会说的生日句子（口头禅/人生信条/最想对我说的话，10-20字）；\n3) title：卡片标题短语（4-10字，人设专属，如「深渊的贺礼」「来自星海的信号」）；\n4) bg1、bg2：两个十六进制颜色，组成卡片渐变背景，要贴合角色世界观色调；\n5) accent：一个十六进制强调色（装饰与署名用，要比背景亮）；\n6) deco：3-5个贴合角色气质的装饰emoji；\n7) style：卡片设计风格的一句话描述（如「哥特暗黑」「赛博霓虹」「手账贴纸」「水墨留白」「欧式信笺」……会决定排版与装饰气质）；\n8) pattern：背景纹样关键词，从下面选一个最贴合角色的：thorn(荆棘)/gear(齿轮)/star(星光)/sakura(花瓣)/leaf(藤蔓)/hex(蜂巢)/grid(网格)/wave(波纹)/crack(裂纹)/dot(点阵)。\n不要任何解释，只输出一个 JSON 对象，严格如下格式：\n{"wish":"...","motto":"...","title":"...","bg1":"#xxxxxx","bg2":"#xxxxxx","accent":"#xxxxxx","deco":["...","..."],"style":"...","pattern":"..."}';
     const usr = '今天是我生日。';
     let raw;
     if (settings.useMain) {
@@ -158,6 +162,8 @@ async function genWish(char, force) {
         bg2: d && isHex(d.bg2) ? String(d.bg2) : fb.bg2,
         accent: d && isHex(d.accent) ? String(d.accent) : fb.accent,
         deco: d && Array.isArray(d.deco) && d.deco.length ? d.deco.slice(0, 5).map(String) : fb.deco,
+        style: d && d.style ? String(d.style).trim() : fb.style,
+        pattern: d && d.pattern ? String(d.pattern).trim() : fb.pattern,
     };
     cache[key] = out;
     localStorage.setItem(LS_WISHES, JSON.stringify(cache));
@@ -186,6 +192,8 @@ function fallbackDesign(char) {
         bg2: hslToHex((hue + 30) % 360, 45, 28),
         accent: hslToHex((hue + 200) % 360, 65, 62),
         deco: ['🎁', '🕯️', '🌹'],
+        style: '经典信笺',
+        pattern: 'dot',
     };
 }
 
@@ -208,17 +216,89 @@ function isLight(hex) {
     return (0.299 * r + 0.587 * g + 0.114 * b) > 150;
 }
 
+// 纹样关键词 → 标准图案 id
+function detectPattern(p) {
+    const s = String(p || '').toLowerCase();
+    const map = [['thorn', ['thorn', '荆棘', '荆', '刺']], ['gear', ['gear', '齿轮', '机械']], ['star', ['star', '星']], ['sakura', ['sakura', '樱花', '花瓣', '花']], ['leaf', ['leaf', '藤蔓', '叶']], ['hex', ['hex', '蜂巢']], ['grid', ['grid', '网格']], ['wave', ['wave', '波纹', '水']], ['crack', ['crack', '裂纹', '裂']], ['dot', ['dot', '点阵', '点']]];
+    for (const m of map) for (const k of m[1]) if (s.includes(k)) return m[0];
+    return 'dot';
+}
+
+// 生成纹样 SVG data URI（HTML 卡片背景图层）
+function patternSVG(kind, color) {
+    const c = color || '#ffffff';
+    const svgs = {
+        dot: '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><circle cx="12" cy="12" r="1.5" fill="' + c + '" fill-opacity=".4"/></svg>',
+        grid: '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><path d="M40 0H0V40" fill="none" stroke="' + c + '" stroke-opacity=".25"/></svg>',
+        wave: '<svg xmlns="http://www.w3.org/2000/svg" width="80" height="24"><path d="M0 12 Q10 2 20 12 T40 12 T60 12 T80 12" fill="none" stroke="' + c + '" stroke-opacity=".35" stroke-width="1.5"/></svg>',
+        hex: '<svg xmlns="http://www.w3.org/2000/svg" width="56" height="50"><path d="M28 0l12 7v14l-12 7-12-7V7z" fill="none" stroke="' + c + '" stroke-opacity=".3"/></svg>',
+        star: '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><path d="M20 4l4 12h12l-10 8 4 12-10-7-10 7 4-12-10-8h12z" fill="' + c + '" fill-opacity=".32"/></svg>',
+        sakura: '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><ellipse cx="20" cy="10" rx="4" ry="9" fill="' + c + '" fill-opacity=".32" transform="rotate(35 20 20)"/><ellipse cx="28" cy="26" rx="4" ry="9" fill="' + c + '" fill-opacity=".32" transform="rotate(-35 28 26)"/></svg>',
+        leaf: '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48"><path d="M4 44 C4 20 20 4 44 4 C44 28 28 44 4 44Z" fill="none" stroke="' + c + '" stroke-opacity=".32"/><path d="M4 44 C16 32 28 24 44 8" stroke="' + c + '" stroke-opacity=".32" fill="none"/></svg>',
+        thorn: '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><path d="M0 32 C10 26 18 18 24 8" stroke="' + c + '" stroke-opacity=".45" fill="none"/><path d="M22 12 l6 -4 l-1 7" stroke="' + c + '" stroke-opacity=".45" fill="none"/><path d="M8 30 l4 -6" stroke="' + c + '" stroke-opacity=".45"/></svg>',
+        crack: '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48"><path d="M0 20 L14 14 L22 22 L34 10 L48 18" stroke="' + c + '" stroke-opacity=".32" fill="none"/><path d="M14 14 L10 30" stroke="' + c + '" stroke-opacity=".32" fill="none"/><path d="M34 10 L30 26 L38 38" stroke="' + c + '" stroke-opacity=".32" fill="none"/></svg>',
+        gear: '<svg xmlns="http://www.w3.org/2000/svg" width="56" height="56"><g fill="none" stroke="' + c + '" stroke-opacity=".32"><circle cx="28" cy="28" r="10"/><circle cx="28" cy="28" r="4"/></g><g fill="' + c + '" fill-opacity=".28"><rect x="26" y="2" width="4" height="10"/><rect x="26" y="44" width="4" height="10"/><rect x="2" y="26" width="10" height="4"/><rect x="44" y="26" width="10" height="4"/></g></svg>',
+    };
+    return 'url("data:image/svg+xml,' + encodeURIComponent(svgs[kind] || svgs.dot) + '")';
+}
+
+// Canvas 纹样绘制（保存图片时使用，与 HTML 卡片同一套纹样）
+function drawPattern(g, kind, W, H, color, alpha) {
+    g.save();
+    g.globalAlpha = (alpha == null ? 0.3 : alpha);
+    g.strokeStyle = color;
+    g.fillStyle = color;
+    g.lineWidth = 1.2;
+    switch (kind) {
+        case 'dot':
+            for (let x = 16; x < W; x += 28) for (let y = 16; y < H; y += 28) { g.beginPath(); g.arc(x, y, 1.6, 0, Math.PI * 2); g.fill(); }
+            break;
+        case 'grid':
+            for (let x = 20; x < W; x += 40) { g.beginPath(); g.moveTo(x, 0); g.lineTo(x, H); g.stroke(); }
+            for (let y = 20; y < H; y += 40) { g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke(); }
+            break;
+        case 'wave':
+            for (let y = 14; y < H; y += 48) { g.beginPath(); for (let x = 0; x <= W; x += 8) { const yy = y + Math.sin(x / 16) * 7; if (x === 0) g.moveTo(x, yy); else g.lineTo(x, yy); } g.stroke(); }
+            break;
+        case 'hex':
+            for (let x = 0; x < W + 60; x += 56) for (let y = ((x / 56) % 2 ? 14 : 42); y < H; y += 84) { g.beginPath(); for (let i = 0; i < 6; i++) { const a = i * Math.PI / 3 - Math.PI / 2; const px = x + Math.cos(a) * 14, py = y + Math.sin(a) * 14; if (i === 0) g.moveTo(px, py); else g.lineTo(px, py); } g.closePath(); g.stroke(); }
+            break;
+        case 'star':
+            for (let x = 24; x < W; x += 44) for (let y = 24; y < H; y += 44) { g.beginPath(); for (let i = 0; i < 10; i++) { const a = i * Math.PI / 5 - Math.PI / 2; const r = i % 2 ? 4 : 9; g.lineTo(x + Math.cos(a) * r, y + Math.sin(a) * r); } g.closePath(); g.fill(); }
+            break;
+        case 'sakura':
+            for (let x = 24; x < W; x += 60) for (let y = 24; y < H; y += 60) { g.save(); g.translate(x, y); for (let i = 0; i < 5; i++) { g.rotate(Math.PI * 2 / 5); g.beginPath(); g.ellipse(0, -8, 3.5, 7, 0, 0, Math.PI * 2); g.fill(); } g.restore(); }
+            break;
+        case 'leaf':
+            for (let x = 24; x < W; x += 70) for (let y = 24; y < H; y += 70) { g.beginPath(); g.moveTo(x - 14, y + 14); g.quadraticCurveTo(x, y - 14, x + 14, y - 14); g.quadraticCurveTo(x + 10, y + 6, x - 14, y + 14); g.stroke(); }
+            break;
+        case 'thorn':
+            for (let x = 0; x < W; x += 56) { g.beginPath(); g.moveTo(x, H); g.quadraticCurveTo(x + 18, H - 40, x + 34, H - 90); g.stroke(); g.beginPath(); g.moveTo(x + 30, H - 76); g.lineTo(x + 42, H - 84); g.lineTo(x + 34, H - 66); g.closePath(); g.fill(); }
+            break;
+        case 'crack':
+            for (let x = 8; x < W; x += 52) { let y = 0; g.beginPath(); g.moveTo(x, y); while (y < H) { y += 14 + (x % 9); g.lineTo(x + ((x * 7 + y) % 19) - 9, y); } g.stroke(); }
+            break;
+        case 'gear':
+            for (let cx = 28; cx < W; cx += 64) for (let cy = 28; cy < H; cy += 64) { g.beginPath(); g.arc(cx, cy, 9, 0, Math.PI * 2); g.stroke(); g.beginPath(); g.arc(cx, cy, 3.5, 0, Math.PI * 2); g.stroke(); for (let i = 0; i < 8; i++) { const a = i * Math.PI / 4; g.fillRect(cx + Math.cos(a) * 10 - 1.4, cy + Math.sin(a) * 10 - 1.4, 2.8, 2.8); } }
+            break;
+    }
+    g.restore();
+}
+
 // ---------- 卡片渲染 & 保存 ----------
 function cardHTML(char, obj) {
     const o = typeof obj === 'string'
-        ? { wish: obj, motto: '', title: char.name + ' 的赠礼', bg1: '#2a1515', bg2: '#4a1f1f', accent: '#E06060', deco: ['🎁', '🕯️', '🌹'] }
+        ? { wish: obj, motto: '', title: char.name + ' 的赠礼', bg1: '#2a1515', bg2: '#4a1f1f', accent: '#E06060', deco: ['🎁', '🕯️', '🌹'], style: '经典信笺', pattern: 'dot' }
         : (obj || {});
     const deco = Array.isArray(o.deco) && o.deco.length ? o.deco : ['🎁'];
     const body = isLight(o.bg1) ? '#4a3a3a' : '#f2e2e6';
+    const pat = patternSVG(detectPattern(o.pattern), body);
+    const styleTxt = o.style ? String(o.style).slice(0, 12) : '';
     return '<div class="st-bw-card" data-avatar="' + escapeHtml(char.avatar) + '" style="background:linear-gradient(135deg,' + o.bg1 + ',' + o.bg2 + ');border:1px solid ' + o.accent + ';">' +
+        '<div class="st-bw-card-pattern" style="background-image:' + pat + ';"></div>' +
         '<div class="st-bw-card-deco">' + deco.map(function (d) { return '<span>' + escapeHtml(d) + '</span>'; }).join('') + '</div>' +
         '<div class="st-bw-card-title" style="color:' + o.accent + ';">' + escapeHtml(o.title || (char.name + ' 的赠礼')) + '</div>' +
-        '<div class="st-bw-card-tag" style="color:' + o.accent + ';">' + escapeHtml(char.name) + '</div>' +
+        '<div class="st-bw-card-tag" style="color:' + o.accent + ';">' + escapeHtml(char.name) + (styleTxt ? ' · ' + escapeHtml(styleTxt) : '') + '</div>' +
         '<div class="st-bw-card-motto">' + (o.motto ? '「' + escapeHtml(o.motto) + '」' : '') + '</div>' +
         '<div class="st-bw-card-wish" style="color:' + body + ';">' + escapeHtml(o.wish || '') + '</div>' +
         '<div class="st-bw-card-from" style="color:' + o.accent + ';">—— ' + escapeHtml(char.name) + '</div>' +
@@ -232,11 +312,12 @@ function cardHTML(char, obj) {
 function buildCanvasCard(char, obj, size) {
     const W = 600, H = 360;
     const o = typeof obj === 'string'
-        ? { wish: obj, motto: '', title: char.name + ' 的赠礼', bg1: '#2a1515', bg2: '#4a1f1f', accent: '#E06060', deco: ['🎁', '🕯️', '🌹'] }
+        ? { wish: obj, motto: '', title: char.name + ' 的赠礼', bg1: '#2a1515', bg2: '#4a1f1f', accent: '#E06060', deco: ['🎁', '🕯️', '🌹'], style: '经典信笺', pattern: 'dot' }
         : (obj || {});
     const deco = Array.isArray(o.deco) && o.deco.length ? o.deco : ['🎁'];
     const g1 = o.bg1, g2 = o.bg2;
     const body = isLight(g1) ? '#4a3a3a' : '#f2e2e6';
+    const pat = detectPattern(o.pattern);
     const canvas = document.createElement('canvas');
     canvas.width = W; canvas.height = H;
     const g = canvas.getContext('2d');
@@ -247,6 +328,8 @@ function buildCanvasCard(char, obj, size) {
     grad.addColorStop(1, g1);
     g.fillStyle = grad;
     g.fillRect(0, 0, W, H);
+    // 纹样背景层
+    drawPattern(g, pat, W, H, body);
     // 装饰圆（强调色）
     g.fillStyle = o.accent;
     g.globalAlpha = .55;
@@ -261,11 +344,15 @@ function buildCanvasCard(char, obj, size) {
     g.fillText(deco[0], 26, 320);
     if (deco[1]) g.fillText(deco[1], W - 96, 58);
     g.textAlign = 'center';
-    // 标题（AI 专属短语）
+    // 标题（AI 专属短语）+ 两侧装饰短线
     g.fillStyle = o.accent;
-    g.font = 'bold 24px "Segoe UI", "Microsoft YaHei", sans-serif';
-    g.fillText(String(o.title || char.name + ' 的赠礼'), W / 2, 46);
-    // 角色名
+    g.font = 'bold 26px "Segoe UI", "Microsoft YaHei", sans-serif';
+    const title = String(o.title || char.name + ' 的赠礼');
+    g.fillText(title, W / 2, 48);
+    const tw = g.measureText(title).width;
+    g.fillRect(W / 2 - tw / 2 - 46, 44, 30, 2.5);
+    g.fillRect(W / 2 + tw / 2 + 16, 44, 30, 2.5);
+    // 角色名 + 风格标签
     g.fillStyle = o.accent;
     g.font = 'bold 14px "Segoe UI", "Microsoft YaHei", sans-serif';
     g.fillText(char.name, W / 2, 70);
@@ -279,7 +366,7 @@ function buildCanvasCard(char, obj, size) {
     g.font = '16px "Segoe UI", "Microsoft YaHei", sans-serif';
     const maxW = W - 80;
     const lines = wrapText(g, o.wish || '', maxW);
-    let y = 132;
+    let y = 134;
     for (const ln of lines.slice(0, 8)) { g.fillText(ln, W / 2, y); y += 26; }
     // 署名
     g.fillStyle = o.accent;
@@ -339,6 +426,11 @@ function openOverlay(list) {
             if (!$('#' + OVERLAY_ID).length) return;
             $inner.find('.st-bw-loading').remove();
             $inner.append(cardHTML(char, obj));
+            if (list.length > 1) {
+                $inner.append('<div class="st-bw-nav">' +
+                    '<span class="st-bw-nav-btn' + (idx === 0 ? ' disabled' : '') + '" data-nav="prev">← 上一张</span>' +
+                    '<span class="st-bw-nav-btn' + (idx === list.length - 1 ? ' disabled' : '') + '" data-nav="next">下一张 →</span></div>');
+            }
         }).catch(e => {
             if (!$('#' + OVERLAY_ID).length) return;
             $inner.find('.st-bw-loading').html('⚠ ' + escapeHtml(e.message));
@@ -346,8 +438,12 @@ function openOverlay(list) {
         // 翻页
         $inner.find('.st-bw-close').on('click', function () { $ov.remove(); });
         $inner.off('click.stbwNav');
-        $inner.on('click.stbwNav', '.st-bw-prev', function () { if (idx > 0) { idx--; render(); } });
-        $inner.on('click.stbwNav', '.st-bw-next', function () { if (idx < list.length - 1) { idx++; render(); } });
+        $inner.on('click.stbwNav', '.st-bw-nav-btn', function () {
+            const $b = $(this);
+            if ($b.hasClass('disabled')) return;
+            if ($b.attr('data-nav') === 'prev' && idx > 0) { idx--; render(); }
+            if ($b.attr('data-nav') === 'next' && idx < list.length - 1) { idx++; render(); }
+        });
         $inner.on('click.stbwNav', '.st-bw-act', function () {
             const act = $(this).attr('data-act');
             if (act === 'regen') {
@@ -416,6 +512,12 @@ function openPanel() {
         $panel.find('#st-bw-row-baseurl, #st-bw-row-apikey, #st-bw-row-model').toggle(!useMain);
     };
     $panel.on('click.stbwAct', '#st-bw-usemain', syncRows);
+    $panel.on('change.stbwAct', '#st-bw-usemain', function () {
+        settings.useMain = $(this).is(':checked');
+        syncRows();
+        saveSettings();
+        $panel.append('<div class="st-bw-note st-bw-ok">✓ 已切换：' + (settings.useMain ? '使用酒馆主 API' : '使用副 API') + '</div>');
+    });
     $panel.on('change.stbwAct', '#st-bw-enabled', function () {
         $panel.find('#st-bw-enabled-tip').text($(this).is(':checked') ? '已启用' : '已停用（不再自动弹祝福）');
     });
@@ -552,14 +654,22 @@ if (!document.getElementById(STYLE_ID)) {
 .st-bw-close { position:absolute; top:10px; right:14px; z-index:2; font-size:20px; cursor:pointer; color:#E88383; opacity:.9; }
 .st-bw-count { text-align:center; font-size:12px; opacity:.9; margin-bottom:6px; color:#E88383; }
 .st-bw-loading { text-align:center; padding:40px 0; color:#E88383; }
-.st-bw-card { border-radius:16px; padding:22px 22px 14px; box-shadow:0 8px 30px rgba(0,0,0,.35); }
-.st-bw-card-deco { display:flex; justify-content:center; gap:14px; font-size:22px; margin-bottom:8px; }
-.st-bw-card-title { text-align:center; font-size:22px; font-weight:700; margin-bottom:4px; }
-.st-bw-card-tag { text-align:center; font-size:12px; font-weight:700; margin-bottom:8px; opacity:.9; }
-.st-bw-card-motto { text-align:center; font-size:17px; font-weight:700; margin-bottom:12px; min-height:24px; }
-.st-bw-card-from { text-align:center; font-size:15px; font-weight:700; margin:12px 0 2px; }
-.st-bw-card-wish { font-size:15px; line-height:1.7; text-align:center; word-break:break-all; }
-.st-bw-card-actions { display:flex; justify-content:center; gap:12px; margin-top:12px; }
+.st-bw-card { position:relative; border-radius:16px; padding:22px 22px 14px; box-shadow:0 8px 30px rgba(0,0,0,.35); overflow:hidden; }
+.st-bw-card-pattern { position:absolute; inset:0; pointer-events:none; opacity:.85; }
+.st-bw-card-deco { position:relative; display:flex; justify-content:center; gap:14px; font-size:22px; margin-bottom:8px; }
+.st-bw-card-title { position:relative; text-align:center; font-size:23px; font-weight:700; margin-bottom:4px; letter-spacing:.5px; }
+.st-bw-card-title::before, .st-bw-card-title::after { content:''; position:absolute; top:50%; width:34px; height:2.5px; background:currentColor; opacity:.75; }
+.st-bw-card-title::before { left:calc(50% - 118px); }
+.st-bw-card-title::after { right:calc(50% - 118px); }
+.st-bw-card-tag { position:relative; text-align:center; font-size:12px; font-weight:700; margin-bottom:8px; opacity:.92; }
+.st-bw-card-motto { position:relative; text-align:center; font-size:17px; font-weight:700; margin-bottom:12px; min-height:24px; }
+.st-bw-card-from { position:relative; text-align:center; font-size:15px; font-weight:700; margin:12px 0 2px; }
+.st-bw-card-wish { position:relative; font-size:15px; line-height:1.7; text-align:center; word-break:break-all; }
+.st-bw-card-actions { position:relative; display:flex; justify-content:center; gap:12px; margin-top:12px; }
+.st-bw-nav { display:flex; justify-content:center; gap:10px; margin-top:14px; }
+.st-bw-nav-btn { padding:6px 18px; border-radius:20px; cursor:pointer; font-size:13px; background:#8B1A1A; color:#fff; font-weight:700; }
+.st-bw-nav-btn:hover { filter:brightness(1.15); }
+.st-bw-nav-btn.disabled { opacity:.35; cursor:default; filter:none; }
 .st-bw-act { padding:6px 14px; border-radius:20px; cursor:pointer; font-size:12px; background:rgba(139,26,26,.35); color:#f2e2e6; font-weight:700; border:1px solid rgba(255,255,255,.25); }
 .st-bw-act:hover { background:rgba(139,26,26,.55); }
 `;
